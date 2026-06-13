@@ -2652,3 +2652,1644 @@ A: The payment_attempts record is written first. A reconciliation job (every min
 A: Cache the seat map bitmask in Redis per event, refreshed every 3-5 s. Users accept slight staleness on display; the authoritative check is the atomic UPDATE at reservation time.
 
 ---
+
+---
+
+## 18 — Google Docs / Collaborative Editing
+**Asked at:** Google, Microsoft  **Difficulty:** 🔴  **Level:** SDE-2/Senior
+
+**1. Requirements**
+*Functional:*
+- Multiple users can edit the same document simultaneously in real time
+- Changes from any user appear on all other users' screens within ~500 ms
+- Each user's cursor position and selection is visible to others (presence)
+- Full revision history — view any past version, diff between versions, restore
+- Offline editing: buffer local changes and sync on reconnect
+- Comments and suggestions (track-changes) mode
+- Sharing with permission levels: viewer, commenter, editor, owner
+
+*Non-functional:*
+- Latency: local keystroke response < 16 ms (must feel instant); remote propagation < 500 ms P99
+- Availability: 99.99% (documents are business-critical)
+- Consistency: eventual consistency for concurrent edits; conflict-free merge required
+- Scale: 1 B documents, 50 M DAU, peak 100 K concurrent collaborative sessions
+- Durability: zero data loss — every committed operation persisted to durable log
+
+**2. Back-of-envelope estimation**
+- 50 M DAU; avg 3 documents opened/day = 150 M doc-open events/day
+- Collaborative sessions: assume 5% of sessions are concurrent multi-user = 7.5 M collaborative sessions/day; peak 100 K concurrent
+- Operations (keystrokes): avg active user types 40 ops/min during a 20-min session = 800 ops/session; 50 M * 800 = 40 B ops/day = ~460 K ops/sec peak (10x avg) = 460 K write ops/sec
+- Storage per op: ~50 bytes (op type, position, author, timestamp) = 460 K * 50 = 23 MB/sec raw operation log; ~700 GB/day
+- Document snapshots: full snapshot every 1000 ops; avg doc 50 KB * 1 B docs = 50 TB snapshot storage total
+- Bandwidth: 100 K concurrent sessions * 10 ops/sec broadcast to avg 3 peers = 3 M op-messages/sec; at 100 bytes each = 300 MB/sec outbound
+
+**3. API design**
+```
+# Open document session (returns WebSocket URL + doc state)
+GET /docs/{docId}/session
+Response: { wsUrl, docId, snapshotVersion, snapshot, revision }
+
+# WebSocket message: client sends an operation
+WS SEND: { type:"op", docId, revision, op: { type:"insert"|"delete"|"retain", pos, chars, author } }
+
+# WebSocket message: server broadcasts transformed operation
+WS RECV: { type:"op", op: { ... }, serverRevision, authorId }
+
+# WebSocket message: presence broadcast
+WS RECV: { type:"presence", userId, cursor:{ pos, selStart, selEnd }, color }
+
+# HTTP: fetch revision history
+GET /docs/{docId}/revisions?from=100&to=200
+Response: [{ revision, op, userId, timestamp }]
+
+# HTTP: restore to a revision
+POST /docs/{docId}/restore
+Body: { targetRevision: 150 }
+
+# HTTP: get snapshot near a revision (for fast load)
+GET /docs/{docId}/snapshot?nearRevision=500
+Response: { snapshot, snapshotRevision }
+```
+
+**4. Data model / schema**
+```
+documents
+  doc_id        UUID PK
+  owner_id      UUID FK users
+  title         TEXT
+  created_at    TIMESTAMPTZ
+  updated_at    TIMESTAMPTZ
+  current_rev   BIGINT          -- monotonically increasing server revision counter
+
+-- Append-only operation log (sharded by doc_id)
+operations
+  doc_id        UUID  (shard key)
+  revision      BIGINT           -- server-assigned, sequential per doc
+  op_data       JSONB            -- { type, pos, chars, authorId }
+  author_id     UUID
+  client_rev    BIGINT           -- revision client believed they were at
+  created_at    TIMESTAMPTZ
+  PRIMARY KEY (doc_id, revision)
+  INDEX (doc_id, revision)       -- range scan for catchup
+
+-- Periodic snapshots to avoid replaying the full log on every open
+snapshots
+  doc_id          UUID  (shard key)
+  snapshot_rev    BIGINT
+  content         TEXT / BYTEA   -- full document state at snapshot_rev
+  created_at      TIMESTAMPTZ
+  PRIMARY KEY (doc_id, snapshot_rev)
+
+-- Sharing / permissions
+permissions
+  doc_id      UUID
+  user_id     UUID
+  role        ENUM(viewer, commenter, editor, owner)
+  PRIMARY KEY (doc_id, user_id)
+```
+Shard/partition key: `doc_id` — all operations for a document are co-located. Use consistent hashing across Cassandra or CockroachDB nodes.
+
+**5. High-level architecture**
+```
+Clients (Browser / Mobile)
+        |  HTTPS for REST  |  WebSocket for real-time ops
+        v                  v
+   +----------------------------------------------+
+   |           Load Balancer                       |
+   |  (sticky sessions by docId hash)             |
+   +---------------+------------------------------+
+                   |
+   +---------------v--------------------------------------------------+
+   |               Collaboration Service (stateful)                    |
+   |  One process owns each active document session                    |
+   |  * Receives raw ops from clients over WS                         |
+   |  * Runs OT transform engine                                      |
+   |  * Broadcasts transformed ops to all clients in session          |
+   |  * Maintains in-memory document state + revision counter         |
+   +-------+------------------+---------------------------------------+
+           | persist ops       | presence & routing
+   +-------v----------+  +----v---------------------+
+   |  Operation Log   |  |  Redis Pub/Sub            |
+   |  (Cassandra /    |  |  channel: doc:{docId}     |
+   |   CockroachDB)   |  |  for cross-node fan-out   |
+   |  sharded by      |  +---------------------------+
+   |  doc_id          |
+   +-------+----------+
+           | periodic snapshot trigger
+   +-------v----------+
+   |  Snapshot Store  |
+   |  (S3 / GCS)      |
+   |  snapshot every  |
+   |  1000 ops        |
+   +------------------+
+
+   +---------------------------------------------+
+   |           Document Metadata Service          |
+   |  (permissions, sharing, doc list, REST API)  |
+   |  backed by PostgreSQL                        |
+   +---------------------------------------------+
+
+   +---------------------------------------------+
+   |                CDN (CloudFront)              |
+   |  Serves JS bundle, static assets            |
+   +---------------------------------------------+
+```
+
+**6. Deep dive**
+
+**Operational Transformation (OT) vs CRDTs**
+
+OT transforms operations relative to concurrent operations so that all sites converge to the same state. Example: Alice inserts "X" at position 5; concurrently Bob deletes char at position 3. Bob's delete shifts Alice's insert position. OT transforms Alice's op to insert at position 4 before applying at Bob's replica.
+
+The transform function T(op_a, op_b) -> op_a' satisfies: apply(apply(doc, op_a), T(op_b, op_a)) == apply(apply(doc, op_b), T(op_a, op_b)). This is the "diamond property." Google's Wave algorithm (Jupiter protocol) simplifies this by having a central server: clients only need to transform against the server's history, not each other directly. The server maintains a single revision sequence; every client op is transformed against all server ops since the client's base revision.
+
+CRDTs (Conflict-free Replicated Data Types) — specifically sequence CRDTs like RGA or Logoot — assign every character a unique immutable identifier (site ID + counter). Insertions are always relative to identifiers, never positions, so concurrent inserts never conflict; ordering is deterministic by ID. CRDTs enable true peer-to-peer sync without a central transform server. Downside: tombstones (deleted chars stay as markers) bloat memory; harder to implement correctly; position queries are O(n). Figma uses CRDTs; Google Docs uses OT.
+
+**WebSocket real-time sync architecture**
+
+Each active document session is owned by a single Collaboration Service node (selected by consistent hash on docId). All clients editing the same document connect to the same node — the LB uses sticky routing. The node holds in-memory: current document state, current server revision R, and a queue of unacknowledged client ops. When a client sends op(clientRev, op), the node: (1) fetches all server ops with revision > clientRev from its in-memory buffer, (2) transforms op against those, (3) assigns server revision R+1, (4) writes to Cassandra, (5) broadcasts transformed op to all connected clients. Crash recovery: on node restart, load latest snapshot from S3, replay Cassandra log since snapshot_rev.
+
+**Cursor/presence broadcasting**
+
+Presence (cursor positions) is ephemeral and high-frequency — not persisted. Each client sends a presence heartbeat every 1 s over the same WebSocket. The Collaboration Service holds a cursor map { userId -> {pos, color} } in memory and broadcasts diffs to all peers. If a user disconnects, remove from map after 5 s timeout.
+
+**7. Data flow** — Inserting a character
+1. User types "A" at position 47. Browser sends WS message: `{type:"op", clientRev:312, op:{type:"insert", pos:47, chars:"A", authorId:"u1"}}`.
+2. Collaboration Service receives op. Current serverRev = 315. It fetches ops 313, 314, 315 from its in-memory buffer.
+3. OT engine transforms op against those 3 ops: position adjusts from 47 to 49 after accounting for two earlier inserts from another user.
+4. Server assigns revision 316. Writes to Cassandra: `(doc_id, rev=316, op_data, author)`.
+5. Server sends ack to sender: `{type:"ack", serverRev:316}`.
+6. Server broadcasts to all other clients in session: `{type:"op", op:{type:"insert", pos:49, chars:"A"}, serverRev:316}`.
+7. Each receiving client applies the op at position 49 to their local state and advances their known serverRev to 316.
+8. Every 1000 revisions, Snapshot Worker serializes full doc state, uploads to S3, writes snapshot record to Cassandra.
+
+**8. Scaling**
+- **10x (500 K concurrent sessions):** Horizontal scale of Collaboration Service nodes; consistent hash ensures each doc maps to one node; Redis pub/sub handles cases where clients of same doc are on different nodes (rare with sticky routing).
+- **100x (5 M concurrent sessions):** Introduce a dedicated presence pub/sub tier (Redis Cluster); offload snapshot generation to async workers; Cassandra cluster scaled to 20+ nodes with RF=3; operation log partitioned with vnodes.
+- **1000x (50 M concurrent sessions):** Geo-distributed deployment; each region handles its own doc sessions with async cross-region replication for durability; edge nodes for WS termination to reduce latency globally.
+
+**9. Trade-offs**
+- **OT (centralized) vs CRDT (peer-to-peer):** OT chosen — simpler to reason about correctness in a client-server model; server is the single source of truth for revision ordering; no tombstone bloat. CRDTs suit fully offline-first / P2P scenarios but are operationally harder.
+- **Cassandra vs PostgreSQL for op log:** Cassandra chosen — write-heavy append-only workload with high throughput; natural partitioning by doc_id; no need for cross-doc transactions.
+- **Eventual vs strong consistency:** Eventual consistency is acceptable for collaborative text — users tolerate ~500 ms propagation delay. Strong consistency would require distributed locking per character, killing throughput.
+- **Sticky routing cost:** Sticky LB makes node failure require session migration. Mitigation: detect failure, reconnect clients to new node, replay from Cassandra log. Acceptable trade-off for eliminating cross-node OT complexity.
+
+**10. Follow-up questions**
+
+**Q: How do you handle a client that was offline for 2 hours and reconnects?**
+A: Client sends its last known serverRev. Server loads nearest snapshot at or before that rev, then streams all ops from snapshot_rev to current serverRev. Client replays the op log to reconstruct current state. Buffered local ops are then transformed against the full catch-up delta and sent to server.
+
+**Q: How do you implement version history / "see all changes"?**
+A: The operation log in Cassandra IS the version history. To reconstruct document at revision N: load nearest snapshot with snapshot_rev <= N, replay ops from snapshot_rev to N. For diff view: reconstruct state at rev N and N-1 (or use a named snapshot) and run a text diff algorithm (Myers diff).
+
+**Q: What if two users simultaneously rename the document title?**
+A: Document metadata (title, sharing settings) is not subject to OT — it's a last-write-wins field stored in PostgreSQL with optimistic locking (version column). Last committer wins; this is acceptable for metadata updates which are rare.
+
+**Q: How do you keep memory usage bounded on the Collaboration Service?**
+A: Evict sessions idle for > 30 min from memory; persist final state to Cassandra and S3 snapshot. On next access, reload from snapshot. In-memory op buffer is capped at last 1000 ops (enough for OT transform window).
+
+---
+
+## 19 — Distributed Job Scheduler
+**Asked at:** LinkedIn, Uber, Amazon, Microsoft  **Difficulty:** 🟡  **Level:** SDE-2
+
+**1. Requirements**
+*Functional:*
+- Schedule one-time or recurring jobs using cron expressions (e.g., `0 9 * * 1` = every Monday 9 AM)
+- Jobs execute at (or very near) their scheduled time with at-most-once or at-least-once delivery guarantees, configurable per job
+- Support job types: HTTP callback, queue message, arbitrary script/container
+- Job state transitions: PENDING -> RUNNING -> SUCCEEDED / FAILED / TIMED_OUT
+- Retry on failure with configurable retry count and backoff policy (fixed / exponential)
+- Dead-letter queue for jobs that exhausted retries
+- Job history: last N executions with status, start/end time, logs URL
+- Pause, resume, delete individual jobs or job groups
+
+*Non-functional:*
+- Scale: 10 M registered jobs; 100 K jobs firing per minute at peak
+- Scheduling accuracy: fire within +/-1 second of scheduled time P95
+- Availability: 99.99% — scheduler must not be a single point of failure
+- Exactly-once execution (or idempotent at-least-once) — critical for financial jobs
+- Low scheduler overhead: scanning 10 M jobs every second is not acceptable
+
+**2. Back-of-envelope estimation**
+- 10 M registered jobs; assume avg job fires once per hour -> 10 M / 3600 = ~2,778 jobs/sec average; peak (e.g., top-of-hour burst): 100 K jobs/min = 1,667 jobs/sec
+- Job record size: ~200 bytes. 10 M * 200 = 2 GB — fits in memory; also store in DB
+- Execution history: 100 K executions/min * 500 bytes/record = 50 MB/min -> 72 GB/day; retain 30 days = 2.16 TB
+- Scheduler nodes needed: each node can poll and dispatch ~10 K jobs/sec; need ~17 nodes at peak with 2x headroom -> 35 nodes
+- Redis sorted set for time index: 10 M members at 50 bytes each = 500 MB — fits in a single Redis instance (use cluster for redundancy)
+
+**3. API design**
+```
+# Create a new job
+POST /jobs
+Body: {
+  name: "daily-report",
+  type: "http",              // http | sqs | container
+  schedule: "0 9 * * *",    // cron expression or ISO8601 for one-time
+  timezone: "America/New_York",
+  target: { url: "https://...", method:"POST", body:{} },
+  retryPolicy: { maxAttempts: 3, backoff:"exponential", initialDelay:30 },
+  timeout: 300,              // seconds
+  deliveryGuarantee: "at-least-once"  // or "at-most-once"
+}
+Response: { jobId, nextFireAt }
+
+# Get job + last 10 executions
+GET /jobs/{jobId}
+Response: { jobId, schedule, status, nextFireAt, recentExecutions:[...] }
+
+# Pause / resume
+PATCH /jobs/{jobId}/pause
+PATCH /jobs/{jobId}/resume
+
+# Force trigger immediately
+POST /jobs/{jobId}/trigger
+
+# Delete
+DELETE /jobs/{jobId}
+
+# List executions
+GET /jobs/{jobId}/executions?limit=50&cursor=...
+```
+
+**4. Data model / schema**
+```
+jobs  (PostgreSQL — source of truth)
+  job_id            UUID PK
+  name              TEXT
+  owner_id          UUID
+  cron_expr         TEXT        -- null for one-time
+  timezone          TEXT
+  type              ENUM(http, sqs, container)
+  target_config     JSONB       -- url/queue/image depending on type
+  retry_policy      JSONB       -- { maxAttempts, backoff, initialDelay }
+  timeout_secs      INT
+  delivery          ENUM(at_least_once, at_most_once)
+  status            ENUM(active, paused, deleted)
+  next_fire_at      TIMESTAMPTZ  -- computed; indexed
+  created_at        TIMESTAMPTZ
+  INDEX (status, next_fire_at)  -- key query: active jobs due soon
+
+executions  (TimescaleDB / append-only partitioned by month)
+  execution_id      UUID PK
+  job_id            UUID FK jobs
+  attempt           INT
+  status            ENUM(running, succeeded, failed, timed_out)
+  scheduled_at      TIMESTAMPTZ
+  started_at        TIMESTAMPTZ
+  finished_at       TIMESTAMPTZ
+  worker_id         TEXT
+  logs_url          TEXT
+  INDEX (job_id, scheduled_at DESC)
+
+-- Redis: time-indexed queue of due jobs
+SORTED SET  "scheduler:due_jobs"
+  member: job_id (string)
+  score:  next_fire_at as Unix timestamp (float)
+```
+Partition key for executions: `job_id` % N shards if using Cassandra instead of PG.
+
+**5. High-level architecture**
+```
+Clients (API / SDK / UI)
+        |
+   +----v------------------------------------------+
+   |           API Service (stateless)              |
+   |  CRUD for jobs; validates cron; writes PG      |
+   |  Updates Redis sorted set on create/update     |
+   +----+------------------------------------------+
+        | write                 | read
+   +----v--------------+  +----v------------------+
+   |  PostgreSQL        |  |  Redis Cluster         |
+   |  (jobs table)      |  |  Sorted Set:           |
+   |  source of truth   |<-|  score=fire_time       |
+   +-------------------+  |  for fast due-job      |
+                          |  lookup                |
+                          +--------+---------------+
+                                   | ZRANGEBYSCORE poll
+                        +----------v-----------------------------------+
+                        |      Scheduler Nodes (fleet, 35 nodes)       |
+                        |                                               |
+                        |  Each node runs:                              |
+                        |  1. Poller: every 1s ZRANGEBYSCORE            |
+                        |     score <= now+5s LIMIT 500                |
+                        |  2. Locker: SET NX job:{id}:lock 30s         |
+                        |     (distributed lock via Redis)             |
+                        |  3. Dispatcher: fan-out to Worker Queue      |
+                        |  4. Leader Election: one node is "master"    |
+                        |     for re-computing next_fire_at            |
+                        +----------+-----------------------------------+
+                                   | enqueue
+                        +----------v---------------------------------+
+                        |       Job Queue (Kafka)                     |
+                        |  Topic: job_executions                      |
+                        |  Partitioned by job_id                      |
+                        +----------+---------------------------------+
+                                   | consume
+                        +----------v---------------------------------+
+                        |       Worker Pool                           |
+                        |  Pulls from Kafka                           |
+                        |  Executes: HTTP call / SQS msg /            |
+                        |  container invocation                       |
+                        |  Writes execution record to PG              |
+                        |  On success: ACK Kafka offset               |
+                        |  On failure: retry or DLQ                   |
+                        +----------+---------------------------------+
+                                   |
+                        +----------v---------------------------------+
+                        |  Dead-Letter Queue (Kafka DLQ)             |
+                        |  + Alert service                            |
+                        +--------------------------------------------+
+```
+
+**6. Deep dive**
+
+**Cron expression parsing and next_fire_at computation**
+Parse the cron expression (5 or 6 fields: sec, min, hour, dom, month, dow) into a schedule object. Use a library (e.g., Quartz in Java, croniter in Python). To find the next fire time: given current time T and timezone, advance field by field from second to minute to hour to day until all constraints are satisfied. Store the resulting UTC timestamp in `next_fire_at` and in the Redis sorted set as the score. After each execution, the scheduler recomputes the next_fire_at from the completed-execution timestamp (not from original next_fire_at, to avoid drift).
+
+**Distributed lock for exactly-once execution**
+The core problem: multiple scheduler nodes will see the same due job in the Redis sorted set at the same second. Only one should execute it. Solution: use Redis SET NX (set if not exists) with a TTL equal to job timeout + buffer: `SET job:{jobId}:lock {workerId} NX EX 330`. Only the node that wins the SET NX proceeds to enqueue the job. The lock TTL ensures a crashed worker eventually releases the lock so a retry can happen. For at-most-once: do not retry if lock acquisition fails. For at-least-once: retry after lock expiry if execution record shows no success.
+
+**Job state machine**
+```
+PENDING (queued in Kafka)
+   | worker picks up
+   v
+RUNNING (execution record created; lock held)
+   | completes successfully
+   +---> SUCCEEDED (write execution record; release lock; compute next_fire_at; re-insert to sorted set)
+   | exceeds timeout
+   +---> TIMED_OUT (worker kills task; write record; attempt < maxAttempts -> re-queue with backoff delay)
+   | HTTP 5xx / exception
+   +---> FAILED (attempt < maxAttempts -> re-queue with exponential delay; else -> DLQ)
+```
+
+**Retry with exponential backoff**
+On FAILED: delay = initialDelay * 2^(attempt-1) + jitter. For initialDelay=30s, maxAttempts=3: delays are 30s, 60s, 120s. Retry is enqueued by inserting a new entry into the Redis sorted set with score = now + delay. The job in PG gets a `next_retry_at` field updated.
+
+**7. Data flow** — Recurring job fires
+1. Job "send-weekly-report" has next_fire_at = 2026-06-13 09:00:00 UTC.
+2. At 08:59:58, Scheduler Node A's poller runs `ZRANGEBYSCORE scheduler:due_jobs -inf [now+5]` and retrieves the job.
+3. Node A attempts `SET job:abc123:lock nodeA NX EX 330`. Wins the lock.
+4. Node A enqueues message `{jobId:"abc123", executionId:"exec-xyz", attempt:1}` to Kafka topic `job_executions`.
+5. Node A computes next_fire_at = 2026-06-20 09:00:00 UTC, updates PG `jobs.next_fire_at`, and does `ZADD scheduler:due_jobs <next_ts> abc123`.
+6. Worker node consumes from Kafka. Writes `executions(exec-xyz, running, ...)` to PG.
+7. Worker makes HTTP POST to target URL. Receives 200 OK within 5 seconds.
+8. Worker writes `executions(exec-xyz, succeeded, finished_at=now)` to PG. ACKs Kafka offset.
+9. Worker releases lock: `DEL job:abc123:lock`.
+
+**8. Scaling**
+- **10x (1 M jobs/min):** Shard Redis sorted set by (job_id hash % N) — each scheduler node owns a subset of shards; horizontal scale of scheduler nodes and workers.
+- **100x:** Partition Kafka topics by job type; dedicated worker pools per job type (HTTP workers vs container workers); PG read replicas for history queries; TimescaleDB for execution history with automatic partition pruning.
+- **1000x:** Multi-region deployment with region affinity for jobs (job registered in US fires from US region); use etcd or ZooKeeper for cluster membership and leader election instead of Redis pub/sub.
+
+**9. Trade-offs**
+- **Redis sorted set vs DB polling:** DB polling (SELECT * WHERE next_fire_at <= NOW()) requires a full index scan under heavy load and doesn't scale to 10 M jobs. Redis sorted set gives O(log N) range queries and in-memory speed. Downside: Redis is not the source of truth — PG is. Both must be kept in sync (handled at write time by API service).
+- **Kafka vs SQS for job queue:** Kafka chosen for replayability (replay failed jobs), ordering within a partition, and high throughput. SQS is simpler but lacks replay and has per-message cost at scale.
+- **At-least-once vs exactly-once:** True exactly-once requires distributed transactions (Kafka transactions + DB write atomically). Instead, design jobs to be idempotent, use at-least-once delivery, and detect duplicates via execution record (INSERT OR IGNORE on execution_id).
+
+**10. Follow-up questions**
+
+**Q: How do you handle a "poison" job that always times out and monopolizes a worker?**
+A: After maxAttempts failures, move to DLQ. Worker marks the execution as DEAD in PG. Alert fires to job owner. The job is not re-scheduled until owner explicitly re-enables it. DLQ is a separate Kafka topic with a dedicated consumer for inspection.
+
+**Q: What if the scheduler node crashes after acquiring the lock but before enqueuing to Kafka?**
+A: The Redis lock TTL expires after (timeout + buffer) seconds. A watchdog process on other nodes periodically scans for jobs whose lock has expired but whose execution record shows no `started_at` — these are re-queued. This is the at-least-once retry path.
+
+**Q: How do you ensure top-of-the-hour burst (millions of cron jobs set to "0 * * * *") doesn't overwhelm the system?**
+A: (1) Add random jitter to scheduled times (+/-30s optional, configured per job). (2) Pre-warm the worker pool before the hour. (3) Kafka absorbs the burst naturally — producers (scheduler nodes) enqueue quickly; consumers (workers) process at their rate. (4) Rate-limit dispatch per target domain to avoid thundering-herd on downstream services.
+
+**Q: How do you implement distributed leader election for the scheduler's "master" role?**
+A: Use Redis SETNX with a TTL for a `scheduler:leader` key. The node that holds it is leader; all others are followers. Leader heartbeats the key every TTL/3 seconds. If the leader dies, the key expires and another node wins the next SETNX race. Alternatively use ZooKeeper ephemeral nodes or etcd leases for stronger guarantees.
+
+---
+
+## 20 — Google Search
+**Asked at:** Google  **Difficulty:** 🔴  **Level:** Senior
+
+**1. Requirements**
+*Functional:*
+- Crawl the web continuously and index discovered pages
+- Accept keyword queries and return ranked list of relevant URLs with title + snippet
+- Handle query operators: site:, filetype:, quotes for exact match, minus for exclusion
+- Autocomplete / query suggestions as user types
+- Freshness: breaking news pages indexed within minutes; regular pages within days
+- Personalized ranking based on user history (optional / signed-in users)
+- Localized results: language detection, region-based ranking
+
+*Non-functional:*
+- Scale: crawl 20 B pages; index 100 B terms; serve 9 B queries/day (~100 K QPS)
+- Latency: search result < 200 ms P99; autocomplete < 50 ms
+- Availability: 99.999%
+- Index freshness: high-priority pages re-crawled every 1 hour; avg every 3 days
+- Storage: inverted index ~20 PB (compressed); raw page store ~100 PB
+
+**2. Back-of-envelope estimation**
+- 9 B queries/day = 104 K QPS; peak 3x = 312 K QPS
+- Index size: 20 B pages * avg 500 distinct terms/page = 10 T term-document pairs; at 8 bytes each = 80 TB uncompressed; with variable-byte + delta encoding ~20 TB per replica; 3 replicas = 60 TB per shard group
+- Crawler: crawl 20 B pages, re-crawl every 3 days avg -> 20 B / (3 * 86400) = 77 K pages/sec to crawl
+- Raw HTML: avg page 50 KB * 20 B = 1 PB; store in GCS/S3
+- Postings list per term: avg 1 M documents per common term; with docID + score = 12 bytes -> 12 MB per term; top 1 M terms * 12 MB = 12 TB in hot index tier
+- Serving: 312 K QPS * avg 10 shard fan-out * 1 ms/shard = ~3 M shard-ops/sec
+
+**3. API design**
+```
+# Public search API
+GET /search?q=distributed+systems&page=1&num=10&hl=en&gl=US
+Response: {
+  totalResults: 4200000000,
+  timeTakenMs: 147,
+  results: [
+    { url, title, snippet, lastCrawled, rank },
+    ...
+  ],
+  relatedQueries: ["..."],
+  spellCorrection: "did you mean: ..."
+}
+
+# Autocomplete
+GET /complete?q=dist&hl=en
+Response: { suggestions: ["distributed systems", "disney+", ...] }
+
+# Internal: Crawler submits page
+POST /indexer/ingest
+Body: { url, rawHtml, crawledAt, httpStatus, contentHash }
+
+# Internal: Force re-index a URL (for publishers)
+POST /indexer/submit
+Body: { url }
+```
+
+**4. Data model / schema**
+```
+-- Crawl frontier (URL queue, distributed)
+frontier
+  url_hash    BIGINT PK   -- MurmurHash of normalized URL
+  url         TEXT
+  priority    FLOAT       -- based on PageRank estimate + freshness need
+  last_crawled TIMESTAMPTZ
+  next_crawl  TIMESTAMPTZ
+  etag        TEXT        -- for conditional GET
+  INDEX (next_crawl) WHERE status='active'
+
+-- Raw page store: object storage (S3/GCS)
+  Key: {url_hash}/{crawl_timestamp}.gz
+  Value: gzip(rawHtml)
+
+-- Forward index: docId -> terms + positions (used during indexing)
+-- Stored in BigTable / HBase: rowKey = doc_id
+forward_index
+  doc_id      BIGINT
+  url         TEXT
+  title       TEXT
+  terms       BYTES      -- serialized: [{term, tf, positions:[]}]
+  pagerank    FLOAT
+  crawled_at  TIMESTAMPTZ
+
+-- Inverted index: term -> postings list
+-- Stored in custom segment files (like Lucene), sharded by term hash
+inverted_index_segment
+  term        TEXT  (shard key: hash(term) % N_shards)
+  postings    BYTES -- delta-encoded [(doc_id, tf, positions)...], sorted by score desc
+  df          INT   -- document frequency (for IDF)
+```
+
+**5. High-level architecture**
+```
+Internet
+   |
+   v
++------------------------------------------------------------------+
+|                      CRAWL PIPELINE                               |
+|                                                                   |
+|  URL Frontier ---> Crawler Workers (100K parallel HTTP clients)  |
+|  (distributed    |  * politeness: 1 req/sec per domain           |
+|   priority Q)    |  * robots.txt / noindex respect               |
+|                  |  * DNS cache + HTTP/2                          |
+|                  v                                               |
+|            Raw Page Store (GCS) ---> Content Dedup (simhash)    |
++---------------------------+--------------------------------------+
+                            | raw HTML
+                            v
++------------------------------------------------------------------+
+|                    INDEXING PIPELINE                              |
+|                                                                   |
+|  HTML Parser -> Tokenizer -> Stemmer -> Stop-word filter         |
+|       |              |                                           |
+|       v              v                                           |
+|  Link Extractor  Term Extractor -> TF computation               |
+|  (feeds Frontier)    |                                           |
+|                      v                                           |
+|             Forward Index Writer (BigTable)                      |
+|                      |                                           |
+|             Periodic Map-Reduce / Dataflow job:                  |
+|             Merge forward index -> build inverted index segments  |
+|             Delta encode postings; sort by BM25 score desc       |
++---------------------------+--------------------------------------+
+                            | index segments
+                            v
++------------------------------------------------------------------+
+|                     INDEX SERVING TIER                            |
+|                                                                   |
+|  Leaf Nodes (index shards, 10K+ servers)                         |
+|  Each holds: subset of inverted index in RAM + SSD               |
+|  Handle: lookup term -> fetch postings -> compute local scores   |
+|                  |                                               |
+|  Root / Mixer node (per datacenter)                              |
+|  Receives query -> fans out to all leaf nodes in parallel        |
+|  Collects top-K from each leaf -> merge-sorts -> reranks         |
+|  -> applies personalization -> returns top 10                    |
++---------------------------+--------------------------------------+
+                            |
+   +------------------------v----------------------------------+
+   |              Query Understanding Layer                    |
+   |  * Spell correction (n-gram model)                       |
+   |  * Query tokenization + stemming                         |
+   |  * Named entity recognition                              |
+   |  * Query rewriting / expansion (synonyms)                |
+   |  * SafeSearch classification                             |
+   +------------------------+----------------------------------+
+                            |
+   +------------------------v----------------------------------+
+   |              Frontend / Serving                           |
+   |  Load Balancer -> Query servers (stateless)              |
+   |  Snippet generation (KWIC extraction from doc)           |
+   |  Universal search: merge web + images + news             |
+   |  Cache layer (Memcached) for popular queries              |
+   +-----------------------------------------------------------+
+```
+
+**6. Deep dive**
+
+**Inverted index structure**
+An inverted index maps each term to a postings list: a sorted array of (docID, term_frequency, [positions]) entries. Positions enable phrase queries ("new york" — require term1 position + 1 = term2 position). DocIDs are delta-encoded (store differences between consecutive IDs, not absolute values) because docIDs are large 64-bit numbers but differences are small — variable-byte encoding reduces 8 bytes to 1-3 bytes per entry. Skip pointers every sqrt(N) entries speed up AND-merge of two long postings lists (instead of scanning entire list, jump past blocks). Segmented index: new documents go into a small delta index; periodically merged with main index via log-structured merge (like LevelDB/Lucene).
+
+**Index sharding strategies**
+Two approaches: (1) shard by doc_id (document partitioning) — each shard holds all terms for a subset of documents; a query must fan out to ALL shards and merge results. (2) shard by term (term partitioning) — each shard owns all postings for a subset of terms; a query hits only shards containing its query terms. Google uses document partitioning because it gives better load balance, allows replication of popular shards, and simplifies geo-distribution.
+
+**Ranking overview**
+BM25 score(d, q) = Sum_t IDF(t) * (tf(t,d) * (k1+1)) / (tf(t,d) + k1 * (1-b+b*|d|/avgdl)) where k1~1.2, b~0.75. IDF = log((N - df + 0.5) / (df + 0.5)). PageRank adds a global quality signal. Learning-to-rank (GBDT / neural) takes O(100) features (BM25, PageRank, anchor text, click-through rate, freshness, HTTPS, mobile-friendly) and produces final score. This reranking happens on the mixer after initial BM25 retrieval.
+
+**7. Data flow** — Query serving
+1. User types "distributed systems interview" -> browser sends GET /search?q=...
+2. Query server applies spell-check, tokenization, stemming -> tokens: ["distribut", "system", "interview"].
+3. Mixer node receives query. Fans out to all leaf shard nodes: "get top-200 docs for each token."
+4. Each leaf fetches postings for each token, computes BM25 scores, merges (AND/OR based on query), returns top-200 (docId, score, title_snippet).
+5. Mixer merges responses from all shards (merge-sort by score), deduplicates, takes top-1000.
+6. Reranker applies learning-to-rank model: adds PageRank, freshness, personalization features -> reranked top-10.
+7. Snippet service: for each top-10 docId, fetches stored snippet (pre-computed) or extracts KWIC from stored doc. Highlights query terms.
+8. Response assembled and returned. Total time: ~150 ms.
+9. Popular query result cached in Memcached with TTL 5 min.
+
+**8. Scaling**
+- **10x crawl / index:** Add more crawler workers; increase indexing pipeline parallelism (more Dataflow workers); add more leaf shard nodes.
+- **100x query load:** Add more mixer nodes; replicate each index shard 3x and load-balance across replicas; geo-distribute index to serve from nearest datacenter.
+- **1000x:** Hierarchical serving tree (root -> mixer -> leaves at 3 levels); partition index by content type (web, news, images, video separately); serve from 10+ global datacenters with anycast routing.
+
+**9. Trade-offs**
+- **Push vs pull freshness:** Pull (scheduled re-crawl by priority) chosen over push (publishers ping Google) — push can be abused; pull gives full control over freshness schedule.
+- **Document vs term partitioning:** Document partitioning chosen — simpler load balancing, better fault isolation (a shard failure loses only its docs, not all queries containing a term).
+- **Approximate top-K:** Leaf nodes return approximate top-200 rather than exact scores. Some relevant docs below rank 200 in a leaf may be missed. Acceptable trade-off for 10-100x latency reduction vs exact merge.
+- **Index freshness vs throughput:** Serving a real-time index for every crawled doc would require continuous merges. Instead: delta index (seconds-fresh for breaking news) + main index (days-fresh for everything else) + periodic merges at off-peak hours.
+
+**10. Follow-up questions**
+
+**Q: How do you crawl 20 billion pages without being blocked?**
+A: Respect robots.txt and crawl-delay. One request per second per domain. Identify as Googlebot with a legitimate user-agent. Distribute crawl IPs across large CIDR ranges. Prioritize sitemaps. Use conditional GET (If-Modified-Since / ETag) to skip unchanged pages.
+
+**Q: How do you detect and handle near-duplicate content?**
+A: Compute SimHash (a locality-sensitive hash) of each page's content. Two pages with SimHash Hamming distance < 3 are near-duplicates. Keep highest-quality version (shortest URL, highest PageRank). Store SimHash in frontier DB for fast lookup.
+
+**Q: How do you handle the PageRank computation at scale?**
+A: PageRank is computed periodically (weekly) via a distributed iterative graph algorithm (like Pregel or Spark GraphX) over the link graph. The web graph has ~20 B nodes and ~300 B edges. Each iteration: PR(v) = (1-d)/N + d * Sum PR(u)/out_degree(u). Converges in ~50 iterations. Store final PR scores in BigTable indexed by docId; join with BM25 scores at ranking time.
+
+**Q: How would you design the autocomplete feature?**
+A: Store top-N query suggestions per prefix in a trie or sorted structure. Backed by offline analysis of query logs (top 1 M queries by frequency). Serve from Redis with prefix as key -> list of suggestions. For freshness (trending queries), run a streaming job (Kafka + Flink) that detects queries rising in frequency and inserts them into the autocomplete index in real time.
+
+---
+
+## 21 — Distributed Cache
+**Asked at:** Amazon, Google, Meta  **Difficulty:** 🔴  **Level:** SDE-2/Senior
+
+**1. Requirements**
+*Functional:*
+- Key-value store: get(key), set(key, value, ttl), delete(key)
+- Support for TTL (time-to-live) with lazy expiry + active expiry sweep
+- Atomic operations: incr/decr (for counters), setnx (set-if-not-exists), compare-and-swap
+- Multiple eviction policies: LRU, LFU, allkeys-random, volatile-lru (configurable per namespace)
+- Clustering: distribute data across N nodes with configurable replication factor
+- Client-side routing: clients know which node holds a key (no proxy hop needed)
+
+*Non-functional:*
+- Latency: get/set < 1 ms P99 (in-process network round-trip)
+- Throughput: 10 M ops/sec per cluster
+- Availability: 99.99% — node failures must be handled without manual intervention
+- Consistency: eventual (replication is async) — acceptable for cache use cases
+- Memory efficiency: minimize per-key overhead; support up to 1 TB of data per cluster
+
+**2. Back-of-envelope estimation**
+- 10 M ops/sec; 70% reads, 30% writes = 7 M reads + 3 M writes/sec
+- Avg value size: 1 KB. 3 M writes/sec * 1 KB = 3 GB/sec write throughput per cluster
+- Memory per cluster: 1 TB = 1 T keys at 1 KB avg; with 50-byte overhead per key (key + metadata + pointers) = 1.05 TB raw
+- Nodes: each node handles 500 K ops/sec and holds 100 GB data -> need 20 nodes for throughput; 10 TB / 100 GB = 10 nodes for storage. Bottleneck is throughput -> 20 nodes + 2x headroom = 40 nodes
+- Replication: RF=3, each key on 3 nodes -> ~60 TB aggregate memory across cluster
+- Cache hit rate target: 95% -> 5% misses at 10 M ops/sec = 500 K DB queries/sec — need fast DB backend
+
+**3. API design**
+```
+# Client API (binary protocol — Redis RESP or Memcached protocol)
+SET key value [EX seconds] [NX|XX]
+GET key
+DEL key [key ...]
+MGET key [key ...]          -- multi-get (pipeline)
+MSET key value [key value]  -- multi-set
+INCR key
+INCRBY key delta
+SETNX key value             -- set if not exists (atomic)
+TTL key                     -- remaining TTL in seconds
+SCAN cursor [MATCH pattern] [COUNT count]   -- keyspace iteration
+
+# Cluster management API (HTTP)
+GET  /cluster/nodes          -- list all nodes + slots
+POST /cluster/rebalance      -- trigger shard rebalancing
+GET  /cluster/stats          -- ops/sec, hit rate, memory usage per node
+POST /cluster/nodes/{id}/evict  -- emergency memory reclaim
+```
+
+**4. Data model / schema**
+```
+In-memory per-node data structure:
+
+Hash table (open addressing, power-of-2 sizing)
+  Each slot:
+    key_ptr   -> slab-allocated byte string
+    val_ptr   -> slab-allocated byte string
+    ttl       UINT32    -- absolute expiry epoch seconds (0 = no TTL)
+    freq      UINT16    -- for LFU: access frequency counter
+    last_used UINT32    -- for LRU: last access epoch seconds
+    flags     UINT8     -- type flags
+
+Slab allocator:
+  Memory divided into 1 MB slabs, each holding objects of one size class
+  Size classes: 64B, 128B, 256B, 512B, 1KB, 2KB, 4KB, ... (each ~1.25x previous)
+  Eliminates fragmentation; enables O(1) free
+
+LRU linked list (doubly-linked) maintained per hash table
+  Head = MRU; tail = LRU candidate for eviction
+
+Cluster routing table (on each client):
+  consistent_hash_ring: sorted array of (virtual_node_hash, node_id)
+  Replication positions: primary + next 2 clockwise on ring
+```
+
+**5. High-level architecture**
+```
+Application Servers
+  |  Client library (consistent hash -> direct TCP to node)
+  |  No proxy hop for hot path
+  v
++---------------------------------------------------------------+
+|                  Cache Cluster (40 nodes)                      |
+|                                                                |
+|  +-----------+  +-----------+  +-----------+                  |
+|  |  Node 1   |  |  Node 2   |  |  Node 3   |  ... Node 40    |
+|  |  slots:   |  |  slots:   |  |  slots:   |                 |
+|  |  0 - 4095 |  | 4096-8191 |  | 8192-12287|                 |
+|  |  RF=3:    |  |           |  |           |                 |
+|  |  also     |  |           |  |           |                 |
+|  |  holds    |  |           |  |           |                 |
+|  |  replicas |  |           |  |           |                 |
+|  |  of N2,N3 |  |           |  |           |                 |
+|  +-----------+  +-----------+  +-----------+                  |
+|                                                                |
+|  Gossip protocol between nodes:                               |
+|    * Failure detection (heartbeat every 1s; dead after 3)    |
+|    * Cluster state propagation (new node, removed node)      |
+|    * Slot migration tracking                                  |
++---------------------------------------------------------------+
+  |
+  v
++---------------------------+
+|  Config / Cluster Manager |   (ZooKeeper or etcd)
+|  Stores:                  |   Elects coordinator node
+|  * Node list + slots      |   Detects node failures
+|  * Rebalance state        |   Triggers slot migration
++---------------------------+
+```
+
+**6. Deep dive**
+
+**Consistent hashing ring with virtual nodes — worked example**
+Three physical nodes: N1 (10.0.0.1), N2 (10.0.0.2), N3 (10.0.0.3). Use 150 virtual nodes per physical node = 450 total virtual nodes. Hash space: 0 to 2^32 - 1. Virtual node hashes are evenly distributed around the ring. For a key "user:1234": hash("user:1234") = 2,147,483,789 (example). Walk the ring clockwise to find the first virtual node with hash >= 2,147,483,789. Suppose that's virtual node "N2-vn47" at position 2,147,500,000. So the primary is N2. The next two clockwise virtual nodes map to N3 and N1 -> those are the replica holders. When N2 fails: its virtual nodes are removed from the ring. Only keys in N2's slots need to be re-served from the replicas on N3 and N1. Only ~1/3 of N2's keys are affected rather than all keys (because N2 has virtual nodes scattered across the ring, and each virtual node's successor is a different physical node). This is the core advantage of virtual nodes over simple consistent hashing — even load distribution even with heterogeneous node capacities.
+
+**Hot-key problem and mitigation**
+A viral post's like-count key might receive 100 K reads/sec on a single cache node. Mitigations: (1) Local shadow cache — application servers keep a tiny LRU (e.g., 1000 entries) in process memory; hot keys are cached in every app server's local dict, reducing cache node load from 100 K to 100 K/N_app_servers. (2) Key sharding with suffix — instead of "post:viral", clients randomly choose from "post:viral:0" through "post:viral:9"; reads are spread across 10 keys on potentially 10 different nodes; the "writer" (like counter) writes to all 10 shards; reads sum them up (eventual consistency). (3) Probabilistic early expiry — to prevent thundering herd on expiry, expire the key slightly before its TTL with probability proportional to how close it is to expiry, so individual clients regenerate it before the full burst.
+
+**Cache-aside vs write-through vs write-behind**
+Cache-aside: app reads DB on miss, writes to cache manually. Simple but race condition on concurrent writes: thread A reads old DB value -> thread B writes new value to DB + cache -> thread A overwrites cache with stale value. Fix: use cache-aside with version check or short TTL. Write-through: write to cache and DB synchronously on every update. Keeps cache warm but doubles write latency. Write-behind (write-back): write to cache immediately, return success; async write to DB in background. Fastest writes but risk data loss on cache node crash before async flush.
+
+**7. Data flow** — Cache read (cache-aside pattern)
+1. App calls `cache.get("user:profile:42")`. Client library hashes key -> maps to Node 7 (primary).
+2. TCP request to Node 7. Node 7 looks up key in hash table -> found. Checks TTL: not expired. Moves to head of LRU list. Returns value.
+3. Total latency: ~0.3 ms.
+4. If Node 7 is down: client library detects TCP failure (within 100 ms). Reads from replica on Node 8.
+5. If key is not found (cache miss): client returns null. App queries PostgreSQL -> gets user profile -> calls `cache.set("user:profile:42", value, EX 3600)` -> stored on Node 7 + async replicated to Nodes 8, 9.
+
+**8. Scaling**
+- **10x traffic (100 M ops/sec):** Add more nodes; client library automatically rebalances slots via consistent hashing; slot migration is online (live data moved in background while serving traffic).
+- **100x data (10 PB):** Introduce tiered caching: hot tier (pure in-memory, NVMe-backed for overflow), warm tier (SSD with memory index); keys automatically migrate between tiers by access frequency.
+- **1000x:** Geo-distributed caches per region; cross-region replication for global hot keys; regional cache clusters are independent (no cross-DC synchronous reads).
+
+**9. Trade-offs**
+- **Consistent hashing vs range partitioning:** Consistent hashing chosen — minimal key migration when nodes join/leave (only adjacent slots affected); range partitioning gives sequential key locality (useful for scans) but not needed for a pure key-value cache.
+- **Async vs sync replication:** Async chosen — sync replication requires all replicas to ack before returning, adding 1-2 ms per write. Cache is not the source of truth; slight staleness on failover is acceptable.
+- **LRU vs LFU eviction:** LRU evicts items not accessed recently, which may include still-popular items that happened to not be accessed in the last window (scan pollution). LFU tracks frequency — better for stable hot-key workloads. Redis 4.0+ uses LFU with a frequency counter that decays over time.
+
+**10. Follow-up questions**
+
+**Q: How do you handle the thundering herd on a cache cold start?**
+A: (1) Request coalescing: use a per-key mutex (or promise/future) so only one goroutine/thread fetches from DB; others wait and get the same result. (2) Probabilistic early expiry: as TTL approaches zero, randomly expire the cache entry slightly early so it gets repopulated before the formal expiry, spreading the regeneration across time. (3) Warm the cache proactively from a snapshot of DB data before taking traffic.
+
+**Q: How do you implement atomic increment (INCR) in a distributed cache?**
+A: On the primary node: the hash table entry for the key is updated atomically using a mutex (or via a single-threaded event loop like Redis). The increment is applied in-place, then async-replicated. No two-phase commit needed — the primary always wins; replicas are eventually consistent for counters.
+
+**Q: What happens during a slot migration (adding a new node)?**
+A: The cluster coordinator assigns a slot range to the new node. The source node begins streaming keys in that range to the destination node. During migration, reads/writes for the migrating slot are first tried on the source; if the key has already migrated, source redirects client to destination (MOVED error). Client updates its routing table. Once migration completes, source deletes the migrated keys. This is the Redis Cluster migration protocol — fully online, no downtime.
+
+**Q: How do you ensure cache consistency when the DB is updated?**
+A: Pattern: write DB first, then delete cache entry (not update it). Deleting avoids the race where a stale write overwrites a fresher DB value. Use short TTL as a backstop. For strong consistency needs, use a "refresh-ahead" pattern: a background job subscribes to DB change events (CDC via Debezium) and proactively updates the cache entry.
+
+---
+
+## 22 — Payment System (Stripe / Razorpay)
+**Asked at:** Razorpay, PhonePe, Stripe, Goldman Sachs, PayPal  **Difficulty:** 🔴  **Level:** Senior
+
+**1. Requirements**
+*Functional:*
+- Accept payments from customers via cards, UPI, net banking, wallets
+- Create charges, refunds, and payouts to merchants
+- Support multi-step payments: authorize -> capture -> settle
+- Transfer money between internal accounts (ledger debit/credit)
+- Reconciliation: detect missing or duplicate settlements daily
+- Webhooks to notify merchants of payment status changes
+- Idempotent API — retrying the same request never double-charges
+
+*Non-functional:*
+- Scale: 10 M transactions/day = 116 TPS avg; peak 10x = 1,160 TPS
+- Latency: payment API response < 3 s (includes bank round-trip)
+- Consistency: STRONG — data loss or double-charge is catastrophic
+- Durability: all transactions persisted before response; zero data loss
+- Availability: 99.99% (< 1 hr downtime/year)
+- Auditability: every state transition logged immutably; full audit trail
+
+**2. Back-of-envelope estimation**
+- 10 M txns/day; avg txn value Rs.1,000; total GMV Rs.10 B/day
+- Payment record: ~500 bytes; 10 M * 500 = 5 GB/day; 1.8 TB/year -> manageable in PostgreSQL
+- Ledger entries: 4 rows per transaction (debit + credit * 2 parties) = 40 M rows/day; at 100 bytes/row = 4 GB/day
+- Idempotency table: 1 row per API call; at TTL 24 hrs, ~10 M active rows at any time; 10 M * 200 bytes = 2 GB in memory / Redis
+- Webhook events: 10 M/day * 3 delivery attempts avg = 30 M HTTP calls/day = 347 calls/sec outbound
+- Reconciliation: runs nightly over 10 M records — batch job, not latency-sensitive
+
+**3. API design**
+```
+# Create a payment intent (authorization)
+POST /v1/payment_intents
+Headers: Idempotency-Key: <client-generated-UUID>
+Body: {
+  amount: 10000,       // in smallest currency unit (paise)
+  currency: "INR",
+  paymentMethod: "card",
+  customerId: "cust_abc",
+  metadata: { orderId: "order_xyz" }
+}
+Response: { paymentIntentId, status:"requires_payment_method", clientSecret }
+
+# Confirm payment (capture)
+POST /v1/payment_intents/{id}/confirm
+Headers: Idempotency-Key: <UUID>
+Body: { paymentMethodId: "pm_123", returnUrl: "https://..." }
+Response: { paymentIntentId, status:"succeeded"|"requires_action", nextAction }
+
+# Refund
+POST /v1/refunds
+Headers: Idempotency-Key: <UUID>
+Body: { paymentIntentId: "pi_abc", amount: 5000, reason: "customer_request" }
+Response: { refundId, status:"pending"|"succeeded" }
+
+# Get payment status
+GET /v1/payment_intents/{id}
+Response: { paymentIntentId, status, amount, currency, createdAt, updatedAt, timeline:[...] }
+
+# Webhook registration
+POST /v1/webhooks
+Body: { url: "https://merchant.com/webhook", events:["payment.succeeded","refund.created"] }
+```
+
+**4. Data model / schema**
+```
+-- Idempotency keys (prevent double-charge)
+idempotency_keys
+  idempotency_key  TEXT PK           -- client-provided UUID
+  request_hash     TEXT              -- SHA256 of (endpoint + body)
+  response_body    TEXT              -- cached response JSON
+  status_code      INT
+  created_at       TIMESTAMPTZ
+  expires_at       TIMESTAMPTZ       -- typically now+24h
+  INDEX (expires_at) for TTL cleanup
+
+-- Payment intents (one per checkout attempt)
+payment_intents
+  id               TEXT PK           -- pi_xxx
+  merchant_id      UUID FK merchants
+  customer_id      UUID FK customers
+  amount           BIGINT            -- in smallest unit (paise/cents)
+  currency         CHAR(3)
+  status           ENUM(created, processing, requires_action, succeeded, failed, refunded)
+  payment_method   ENUM(card, upi, netbanking, wallet)
+  idempotency_key  TEXT FK idempotency_keys
+  metadata         JSONB
+  created_at       TIMESTAMPTZ
+  updated_at       TIMESTAMPTZ
+  INDEX (merchant_id, created_at DESC)
+  INDEX (status, created_at) for reconciliation
+
+-- Double-entry ledger (immutable; never UPDATE or DELETE)
+ledger_entries
+  entry_id       BIGSERIAL PK
+  txn_id         TEXT              -- groups debit + credit pair
+  account_id     UUID FK accounts
+  type           ENUM(debit, credit)
+  amount         BIGINT            -- always positive
+  currency       CHAR(3)
+  reference_id   TEXT              -- payment_intent_id or refund_id
+  created_at     TIMESTAMPTZ
+  INDEX (account_id, created_at DESC)
+  INDEX (txn_id)
+
+-- Accounts (merchant float, platform, bank settlement)
+accounts
+  account_id     UUID PK
+  owner_type     ENUM(merchant, customer, platform, bank)
+  owner_id       UUID
+  currency       CHAR(3)
+  -- balance is NOT stored here; derived from SUM(credits) - SUM(debits)
+  -- for performance, maintain a materialized balance with optimistic locking:
+  balance        BIGINT
+  balance_version BIGINT            -- incremented on each update (optimistic lock)
+```
+Shard key: `merchant_id` for payment_intents; `account_id` for ledger_entries.
+
+**5. High-level architecture**
+```
+Client (Browser / Mobile App)
+       | HTTPS
+       v
++----------------------------------------------------------------------+
+|                    API Gateway (Kong / Envoy)                         |
+|  Auth (API key / OAuth), rate limiting, TLS termination              |
++---------------------+-------------------------------------------------+
+                      |
+   +------------------v------------------------------------------------+
+   |               Payment Service (stateless, N instances)            |
+   |  1. Check idempotency key (Redis or PG)                           |
+   |  2. Validate request, create payment_intent record                |
+   |  3. Call Payment Router                                           |
+   +-----------+-------------------------------------------------------+
+               |
+   +-----------v--------------------------------------------+
+   |          Payment Router                                |
+   |  Selects PSP (Razorpay/Stripe/Banks)                   |
+   |  based on: currency, method, %success                  |
+   +-----------+--------------------------------------------+
+               | external HTTP call (< 2s timeout)
+   +-----------v--------------------------------------------+
+   |  PSP (Payment Service Provider) / Bank                |
+   |  Visa/Mastercard networks, UPI NPCI                   |
+   +-----------+--------------------------------------------+
+               | async callback / webhook from PSP
+   +-----------v-------------------------------------------------------+
+   |              Ledger Service (double-entry accounting)              |
+   |  Atomic DB transaction:                                            |
+   |    INSERT ledger_entry(debit, customer_account)                   |
+   |    INSERT ledger_entry(credit, merchant_account)                  |
+   |    INSERT ledger_entry(debit, merchant_account, fee)              |
+   |    INSERT ledger_entry(credit, platform_account, fee)             |
+   |    UPDATE payment_intents SET status=succeeded                    |
+   +----------------------------+--------------------------------------+
+                                |
+   +----------------------------v--------------------------------------+
+   |            Event Bus (Kafka)                                      |
+   |  payment.succeeded, refund.created, payout.initiated             |
+   +--------+----------------------------------------------------------+
+            |                                                   |
+   +--------v--------------------------------+  +----------------v-----------+
+   |   Webhook Delivery Service              |  |   Reconciliation Service   |
+   |   Reads events, delivers to             |  |   Nightly batch: compare   |
+   |   merchant URLs with retry              |  |   PSP settlement report    |
+   |   (exponential backoff, DLQ)            |  |   vs internal ledger       |
+   +-----------------------------------------+  +----------------------------+
+
+   +------------------------------------------------------------------+
+   |                  PostgreSQL (Primary + 2 Replicas)                |
+   |  Tables: idempotency_keys, payment_intents, ledger_entries,      |
+   |          accounts                                                |
+   |  Sharded by merchant_id using Citus or application-level hash    |
+   +------------------------------------------------------------------+
+```
+
+**6. Deep dive**
+
+**Idempotency keys — the most critical piece**
+Client generates a UUID v4 before sending the payment request and sends it as the `Idempotency-Key` header. On the server, the first thing the Payment Service does is: `INSERT INTO idempotency_keys (idempotency_key, request_hash, ...) VALUES (...) ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`. If the insert returns a row: this is the first attempt. Proceed with payment processing. If the insert returns nothing (key already exists): a duplicate request. Retrieve and return the stored response: `SELECT response_body, status_code FROM idempotency_keys WHERE idempotency_key = ?`. The request_hash (SHA256 of endpoint + sorted body) detects misuse: same idempotency key with different body -> 422 Unprocessable Entity. The row is set to expire after 24 hours (cleaned by a background job). This atomic INSERT-or-skip prevents any race condition — two concurrent retries both do the INSERT; only one succeeds; the loser waits for the winner to write the response.
+
+**Double-entry ledger accounting**
+Every money movement creates exactly two ledger entries: one debit and one credit. They always balance: sum of all debits = sum of all credits (accounting identity). Example — customer pays Rs.1,000, platform fee Rs.20:
+```
+txn_id  account               type    amount
+T1      customer_wallet       DEBIT   1000
+T1      merchant_float        CREDIT  980
+T1      merchant_float        DEBIT   20
+T1      platform_fees         CREDIT  20
+```
+The ledger is append-only (immutable). To find a merchant's current balance: `SELECT SUM(CASE WHEN type='credit' THEN amount ELSE -amount END) FROM ledger_entries WHERE account_id = ?`. For performance, maintain a materialized balance column in the `accounts` table, updated via optimistic locking (CAS on balance_version) within the same DB transaction as the ledger insert.
+
+**Saga pattern for multi-step payment**
+A payment involves multiple services: (1) Charge customer, (2) Reserve merchant inventory (optional), (3) Fulfill order, (4) Settle funds to merchant. Each step can fail. Saga pattern: each step has a compensating transaction. If step 3 fails: compensating T3 (cancel fulfillment) + compensating T1 (refund customer). Implemented as an orchestrator-based saga: a saga coordinator persists the current step and drives transitions. On crash, the coordinator resumes from the last persisted step. Each step is idempotent (safe to re-run). This avoids distributed transactions (2PC) while still achieving eventual consistency with compensation on failure.
+
+**7. Data flow** — Successful card payment
+1. Customer clicks "Pay Rs.1,000." Client generates idempotency key `ik_abc123`. Calls POST /v1/payment_intents with the key.
+2. API Gateway authenticates merchant API key. Passes to Payment Service.
+3. Payment Service: INSERT idempotency_key -> succeeds (first attempt). Validate amount/currency. INSERT payment_intents(status=created). Return paymentIntentId + clientSecret to client.
+4. Client confirms payment: POST /confirm with card tokenized by client-side SDK. Payment Service sets status=processing.
+5. Payment Router selects Visa network for card payment. Calls Visa authorization API. Awaits response (< 2s).
+6. Visa responds: approved, authorization code ABC. Payment Service calls Ledger Service.
+7. Ledger Service: in a single ACID transaction, INSERT 4 ledger rows + UPDATE payment_intents status=succeeded + UPDATE account balances with CAS. COMMIT.
+8. Idempotency key updated with response body (status=succeeded).
+9. Ledger Service publishes event `payment.succeeded` to Kafka.
+10. Webhook Delivery Service consumes event, makes HTTP POST to merchant's webhook URL. Merchant's server receives status update, fulfills order.
+11. Payment Service returns 200 response to client with status=succeeded.
+
+**8. Scaling**
+- **10x (1,160 TPS -> 11,600 TPS):** Shard PostgreSQL by merchant_id (Citus); connection pooling via PgBouncer; read replicas for reporting queries; Redis for idempotency key lookup to avoid hot PG row.
+- **100x:** Dedicated ledger DB (append-only, optimized for writes); separate OLTP DB for payment_intents; async ledger posting via Kafka (event-driven ledger update); partition ledger by account_id range.
+- **1000x (UPI-scale: millions TPS):** Multi-region active-active with regional sharding; synchronous cross-region replication only for idempotency keys and ledger; PSP routing with regional fallbacks.
+
+**9. Trade-offs**
+- **Strong consistency (ACID) vs availability:** Payments chosen strong consistency. During a DB partition, reject new payments rather than risk double-charging. "CP" in CAP terms.
+- **Synchronous PSP call vs async:** Synchronous chosen — user expects immediate confirmation. If PSP call times out, return pending status; a background poller checks PSP for final status and reconciles.
+- **Saga vs 2PC:** Saga chosen — 2PC requires all participants to support distributed transactions, is slow (lock held during inter-service calls), and fails catastrophically if coordinator crashes. Saga is slower to compensate but more resilient and doesn't require distributed locking.
+
+**10. Follow-up questions**
+
+**Q: How do you handle a network timeout on the PSP call — you don't know if the charge went through?**
+A: Enter "uncertain" state. Persist payment_intent with status=processing. Background reconciliation job polls PSP API every 30 s for up to 5 min with the original PSP reference ID. If PSP confirms success: run Ledger Service to post entries, emit webhook. If PSP confirms failure: update status=failed, release idempotency key. If no response after 5 min: trigger auto-refund if PSP confirms charge, or mark as failed if not. Never leave a payment in processing state for > 10 min.
+
+**Q: How does reconciliation work?**
+A: Every night, PSP sends a settlement CSV (or the system polls PSP's settlement API). The reconciliation job compares each PSP transaction ID against the internal ledger. Three discrepancy types: (1) PSP has a charge we have no record of -> create internal record + alert. (2) We have a record but PSP does not -> investigate (may indicate a bug or fraud). (3) Amount mismatch -> alert finance team. Discrepancies trigger alerts and are reviewed by finance within 24 hrs.
+
+**Q: How do you prevent fraud?**
+A: Layered defense: (1) Velocity limits: max N transactions per card per hour (Redis counter). (2) Risk scoring: ML model scores each transaction in < 100 ms based on device fingerprint, IP, card BIN, historical patterns. (3) 3DS authentication for high-risk transactions. (4) Address Verification Service (AVS) for card-not-present. (5) Real-time anomaly detection (spike in declines from one merchant -> flag for review).
+
+**Q: How do you handle currency conversion for international payments?**
+A: Maintain a rates service that fetches FX rates from market data providers every minute. Rates are valid for 30 s from quote time. Payment intent stores the quoted rate + quote expiry. If user confirms after quote expiry, re-quote and show new rate. Lock in the rate at authorization time; settlement at actual bank rate; FX risk absorbed by platform with daily hedging.
+
+---
+
+## 23 — Ad Click Aggregator
+**Asked at:** Meta, Google, Amazon  **Difficulty:** 🔴  **Level:** SDE-2/Senior
+
+**1. Requirements**
+*Functional:*
+- Track ad clicks from browsers/apps in real time
+- Aggregate click counts per (ad_id, hour) and per (advertiser_id, day)
+- Expose dashboard queries: "clicks for ad X in the last 7 days, grouped by hour"
+- Deduplicate clicks: same user clicking same ad within 1 hour counts as one click
+- Support late-arriving events (up to 2 hours late) and correct aggregates
+- Provide real-time (< 5 min lag) and historical (up to 3 years) query capability
+- Alert advertisers when daily budget is exhausted (real-time)
+
+*Non-functional:*
+- Scale: 10 B click events/day = 115 K events/sec; peak 500 K events/sec
+- Query latency: dashboard query < 2 s; real-time alert < 30 s
+- Availability: 99.99%
+- Data accuracy: <=0.1% error on aggregate counts (approximate OK for real-time dashboards; exact for billing)
+- Storage: 3 years of hourly aggregates; event log for 30 days for reprocessing
+
+**2. Back-of-envelope estimation**
+- 115 K events/sec; each event: 100 bytes (user_id, ad_id, timestamp, IP, device, creative_id) = 11.5 MB/sec = ~1 TB/day raw event log
+- Kafka: 115 K events/sec * 100 bytes = 11.5 MB/sec -> 3 Kafka brokers with 10x headroom
+- Deduplication window: Redis SET with TTL 1 hr. Key: "ded:{user_id}:{ad_id}:{hour}". Size: if 1 M unique (user, ad) pairs per hour, 1 M * 50 bytes = 50 MB/hr in Redis -> trivially small
+- Aggregates storage: 10 B clicks/day / 24 hrs / (unique ads per hour). Assume 10 M active ads; 10 M * 24 * 365 * 3 = 262 B hourly rows/3 years; at 24 bytes/row = 6.3 TB for hourly agg table
+- OLAP queries: ClickHouse handles 100 M rows/sec scan -> 6.3 TB / 4 KB/block = fast enough
+- Flink cluster: 115 K events/sec / 10 K per task = 12 parallel tasks; 3-node cluster sufficient
+
+**3. API design**
+```
+# Track a click (called by ad SDK embedded in publisher pages)
+POST /v1/clicks
+Body: { adId, userId, publisherId, pageUrl, timestamp, creativeId, deviceType }
+Response: 202 Accepted   -- fire-and-forget; no blocking
+
+# Query click aggregates (advertiser dashboard)
+GET /v1/aggregates/clicks?adId=xxx&from=2026-06-01&to=2026-06-13&granularity=hour
+Response: {
+  adId: "xxx",
+  data: [{ ts: "2026-06-01T00:00:00Z", clicks: 1423 }, ...]
+}
+
+# Query by advertiser
+GET /v1/aggregates/clicks?advertiserId=yyy&from=2026-06-01&to=2026-06-13&granularity=day
+Response: { advertiserId:"yyy", data:[{ date, clicks, impressions, ctr }...] }
+
+# Internal: budget check (called by ad server before showing ad)
+GET /v1/budgets/{advertiserId}/remaining?date=2026-06-13
+Response: { remaining: 4500, currency:"USD", exhausted:false }
+```
+
+**4. Data model / schema**
+```
+-- Raw event stream (Kafka topic, retained 30 days)
+Topic: ad_clicks
+Partition key: ad_id (ensures per-ad ordering)
+Schema (Avro):
+  user_id       STRING
+  ad_id         STRING
+  advertiser_id STRING
+  publisher_id  STRING
+  timestamp     LONG (epoch ms)
+  ip            STRING
+  device_type   ENUM(desktop, mobile, tablet)
+  creative_id   STRING
+  session_id    STRING
+
+-- Deduplicated click events (Kafka topic, after dedup filter)
+Topic: ad_clicks_deduped (same schema)
+
+-- Hourly aggregates (ClickHouse)
+TABLE click_agg_hourly (
+  ad_id         String,
+  advertiser_id String,
+  hour_bucket   DateTime,   -- truncated to hour
+  clicks        UInt64,
+  impressions   UInt64
+)
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(hour_bucket)
+ORDER BY (advertiser_id, ad_id, hour_bucket)
+
+-- Daily budget consumption (ClickHouse materialized view)
+TABLE budget_daily (
+  advertiser_id String,
+  date          Date,
+  clicks        UInt64,
+  spend_usd     Decimal(18,6)
+)
+ENGINE = SummingMergeTree()
+ORDER BY (advertiser_id, date)
+```
+
+**5. High-level architecture**
+```
+Browser / App (ad SDK)
+        | POST /v1/clicks (fire-and-forget, HTTPS)
+        v
++---------------------------------------------------------------+
+|               Click Collector (stateless, 50+ servers)         |
+|  Validates, normalizes, assigns server-side timestamp          |
+|  Produces to Kafka topic "ad_clicks"                          |
++---------------------------------------------------------------+
+                         |
+                    +----v----------------------------------------------+
+                    |           Kafka Cluster (ad_clicks topic)          |
+                    |  Partitioned by ad_id; 30-day retention            |
+                    +----+----------------------------------------------+
+                         | consume
+        +----------------v----------------------------------------------------+
+        |              Flink Streaming Job (Dedup + Aggregate)                  |
+        |                                                                        |
+        |  Stage 1: Deduplication                                                |
+        |    Per event: check Redis SET "ded:{user}:{ad}:{hour}"               |
+        |    SETNX -> if key already exists, drop event                        |
+        |    Else mark + forward to deduped topic                              |
+        |                                                                        |
+        |  Stage 2: Windowed Aggregation                                         |
+        |    Tumbling window: 1-minute counts per (ad_id)                       |
+        |    Sliding window: 1-hour counts (for budget check)                   |
+        |    Watermark: event time; allow 2-hr late events                      |
+        |    Late events trigger aggregate correction                            |
+        |                                                                        |
+        |  Stage 3: Sink                                                         |
+        |    Write minute-aggregates -> ClickHouse (ad_clicks_1min)             |
+        |    Write hour-aggregates -> ClickHouse (click_agg_hourly)             |
+        |    Write budget alerts -> Kafka "budget_alerts" topic                 |
+        +----------------+----------------------------------------------------+
+                         |
+              +----------v-------------------------------------------------+
+              |         ClickHouse OLAP Cluster                             |
+              |  click_agg_hourly (SummingMergeTree)                        |
+              |  Replicated across 3 nodes; sharded by ad_id hash           |
+              |  Dashboard queries: sub-second for 7-day range              |
+              +----------+-------------------------------------------------+
+                         |
+              +----------v-------------------------------------------------+
+              |     Dashboard API (stateless query layer)                   |
+              |  Query ClickHouse; cache popular range queries              |
+              |  in Redis with 60s TTL                                      |
+              +------------------------------------------------------------+
+
+              +--------------------------------------------------+
+              |    Budget Alert Service                           |
+              |  Consumes "budget_alerts" Kafka topic             |
+              |  Calls Ad Server API to pause overspent ads       |
+              |  Sends email/push to advertiser                   |
+              +--------------------------------------------------+
+```
+
+**6. Deep dive**
+
+**Lambda vs Kappa architecture**
+Lambda architecture: two parallel pipelines — a speed layer (stream processing for real-time approximate counts) and a batch layer (periodic exact recomputation over raw data). Query layer merges results. Pro: batch layer ensures accuracy; speed layer gives freshness. Con: complex — two codebases to maintain; batch and stream logic can diverge. Kappa architecture: single stream processing pipeline; raw events are replayed from Kafka (30-day retention) when reprocessing is needed. Pro: one codebase; simpler operations. Con: Kafka retention cost; reprocessing is slower than batch MR. Chosen: Kappa — Flink stream processing + Kafka replay is sufficient; ClickHouse SummingMergeTree handles late-arrival corrections by re-merging.
+
+**Count-min sketch for approximate real-time counts**
+When 500 K events/sec makes exact in-memory counting infeasible for the full space of (ad_id, hour) tuples, a count-min sketch provides approximate counts using O(w*d) memory where w=width, d=depth. For w=10K, d=5: 50K counters * 8 bytes = 400 KB per sketch. Error bound: estimate <= true_count + epsilon*N with probability 1 - delta where epsilon=e/w, delta=e^(-d). For w=10K, d=5: error <=0.027% of total events. Used in Flink for real-time budget-remaining estimates; exact ClickHouse aggregates are used for billing.
+
+**Late-arriving events handling with watermarks**
+Flink tracks event-time watermarks: a monotonically increasing timestamp that represents "we have seen all events with timestamp <= watermark." Watermark = max(event.timestamp seen) - 2 hours (allowed lateness). Events arriving within the 2-hour window after their hour-bucket's window close time still update the aggregate. After the window closes beyond the lateness threshold, a "late" event can still correct the aggregate: Flink re-triggers the window computation and overwrites ClickHouse with the corrected count. For billing (exact counts), always use the 24-hr-delayed finalized aggregate, not the real-time one.
+
+**7. Data flow** — Click event processing
+1. User clicks ad. Ad SDK fires POST /v1/clicks with {adId, userId, timestamp, ...}.
+2. Click Collector validates fields, assigns server_timestamp, produces Avro message to Kafka `ad_clicks` partition = hash(ad_id) % 120.
+3. Flink Dedup stage reads event. Computes dedup key = "ded:user123:ad456:2026061309" (hour bucket). Redis SETNX: if returns 0 (key exists), drop event. If returns 1, forward to deduped stream.
+4. Flink Aggregation stage: adds event to tumbling 1-min window for (ad456, 2026-06-13T09:00). Window fires at :01. Emits {ad_id:"ad456", minute:"2026-06-13T09:00", clicks:347}.
+5. Flink sinks 1-min aggregate to ClickHouse via JDBC bulk insert.
+6. ClickHouse SummingMergeTree merges: click_agg_hourly for (ad456, 2026-06-13T09:00) accumulates minute rows.
+7. Budget check: Flink also maintains a sliding 24-hr window per advertiser_id. When spend crosses 95% of daily budget, emits alert to Kafka `budget_alerts`.
+8. Budget Alert Service consumes, calls Ad Server to soft-pause advertiser's campaigns.
+9. Dashboard query: advertiser queries GET /aggregates/clicks?adId=ad456&granularity=hour. API queries ClickHouse: `SELECT hour_bucket, SUM(clicks) FROM click_agg_hourly WHERE ad_id='ad456' AND hour_bucket BETWEEN ... GROUP BY hour_bucket`. Returns in ~200 ms.
+
+**8. Scaling**
+- **10x events (1.15 M/sec):** Scale Kafka to 30+ brokers; scale Flink to 100+ parallel tasks; Redis Cluster for deduplication; ClickHouse sharding across 10+ nodes.
+- **100x (11.5 M/sec):** Multi-datacenter Kafka with mirroring; hierarchical aggregation (per-DC aggregation -> global merge); abandon per-event dedup (too expensive) -> switch to probabilistic sampling + statistical correction.
+- **1000x:** Pre-aggregate at edge (CDN-level click counting before sending to origin); only send pre-aggregated minute-counts to central pipeline; accept higher approximation error.
+
+**9. Trade-offs**
+- **Lambda vs Kappa:** Kappa chosen — one pipeline to maintain; ClickHouse SummingMergeTree handles corrections from late events; Kafka 30-day retention enables full replay if bugs found.
+- **Exact vs approximate real-time counts:** Count-min sketch for real-time budget estimates (acceptable ~0.03% error); exact ClickHouse aggregates for billing (finalized 24 hrs after day end). Never approximate billing data.
+- **Dedup window size:** 1-hour window balances accuracy vs Redis memory. A smaller window misses multi-click fraud within the window. A larger window requires more Redis memory and increases false-dedup risk for legitimate repeat visits across days.
+
+**10. Follow-up questions**
+
+**Q: How do you handle click fraud (bots)?**
+A: Multi-layer: (1) IP velocity check: >100 clicks/min from one IP -> block (Redis counter). (2) User-agent analysis: headless browser signatures. (3) ML model: features include click-to-impression ratio, geographic anomaly, device fingerprint, time distribution. (4) Honeypot ads: invisible ads that legitimate users can't click — any click is a bot. (5) Post-hoc analysis: daily job that invalidates bot-detected clicks and adjusts billing.
+
+**Q: How do you ensure click data is not lost if the Click Collector crashes?**
+A: Click Collector is stateless. Kafka producers use acks=all (wait for all ISR replicas to confirm). The Collector itself writes nothing to disk — Kafka is the durable store. If a Collector instance crashes mid-batch, the producer's retry logic re-sends unacknowledged messages. Duplicate events are handled by the deduplication stage.
+
+**Q: How do you backfill aggregates when a bug in Flink produces wrong counts?**
+A: (1) Fix the Flink job. (2) Reset Kafka consumer group offset to 30 days ago (or to the point before the bug was introduced). (3) Clear the affected ClickHouse partitions: `ALTER TABLE click_agg_hourly DROP PARTITION '202606'`. (4) Replay events through the fixed Flink job. ClickHouse partitions are rebuilt from clean data. This is the key advantage of Kappa architecture + Kafka retention.
+
+**Q: ClickHouse SummingMergeTree — how does it handle corrections?**
+A: SummingMergeTree merges rows with the same primary key by summing numeric columns. To correct a count: insert a row with the delta (negative delta for downward correction). For example, if we over-counted by 100: INSERT (ad456, 2026-06-13T09:00, clicks=-100). ClickHouse merges it with existing rows on background merge. For billing finalization, run `OPTIMIZE TABLE click_agg_hourly FINAL` to force merge before extracting billing figures.
+
+---
+
+## 24 — Google Maps / Location & Routing
+**Asked at:** Uber, Google, Lyft, Microsoft  **Difficulty:** 🔴  **Level:** Senior
+
+**1. Requirements**
+*Functional:*
+- Display a navigable map with tiles at multiple zoom levels
+- Search for places by name, address, category (restaurants, ATMs)
+- Get driving / walking / transit directions between two points with ETA
+- Real-time traffic layer: show congestion on road segments
+- Driver/delivery tracking: update and query current location of a driver (Uber use case)
+- Offline maps: download a region for offline use
+- Street View / satellite imagery layer
+
+*Non-functional:*
+- Scale: 1 B MAU; 20 M DAU; 5 M concurrent navigation sessions; 1 M driver location updates/sec
+- Latency: tile load < 100 ms; route < 500 ms; driver location query < 100 ms
+- Availability: 99.999% (navigation failure is safety-critical)
+- Map data update: road changes reflected within 24 hours globally
+
+**2. Back-of-envelope estimation**
+- Map tiles: world map at zoom 18 = ~4.5 T tiles; each tile 50 KB -> ~225 PB (not stored all — only populated areas + lower zooms); in practice ~10 PB for all zoom levels
+- Tile serving: 20 M DAU; each user loads ~200 tiles/session = 4 B tile requests/day = 46 K tile QPS; peak 5x = 230 K QPS -> CDN-served
+- Route queries: 20 M DAU * 3 routes/day = 60 M routes/day = 694 route QPS
+- Driver location updates: 1 M drivers * 1 update/4 sec = 250 K writes/sec to Redis
+- Location reads: 5 M concurrent passengers checking driver location every 3 s = 1.67 M reads/sec -> Redis geospatial index
+- Road graph: 50 M road segments worldwide; each node 16 bytes, edge 32 bytes = ~3.2 GB total graph — fits in RAM per routing server
+
+**3. API design**
+```
+# Tile API (slippy map standard)
+GET /tiles/{z}/{x}/{y}.png          -- raster tile (PNG)
+GET /tiles/{z}/{x}/{y}.pbf          -- vector tile (Protobuf)
+Response: binary tile data; CDN-cached; Cache-Control: max-age=86400
+
+# Place search
+GET /places/search?q=pizza&lat=37.7749&lng=-122.4194&radius=2000
+Response: { places:[{ placeId, name, address, lat, lng, category, rating }] }
+
+# Directions / routing
+GET /directions?origin=37.77,-122.41&destination=37.33,-121.88&mode=driving&departAt=now
+Response: {
+  routes: [{
+    distance: 82000,    // meters
+    duration: 3840,     // seconds
+    polyline: "encoded_polyline",
+    steps: [{ instruction, distance, duration, maneuver }]
+  }]
+}
+
+# Driver location update (Uber-like)
+PUT /drivers/{driverId}/location
+Body: { lat, lng, heading, speed, timestamp }
+Response: 200 OK
+
+# Find nearby drivers
+GET /drivers/nearby?lat=37.77&lng=-122.41&radius=2000&type=uberX
+Response: { drivers:[{ driverId, lat, lng, eta, vehicleType }] }
+
+# ETA estimate
+GET /eta?origin=37.77,-122.41&destination=37.33,-121.88
+Response: { etaSeconds: 720, distanceMeters: 12000 }
+```
+
+**4. Data model / schema**
+```
+-- Road network graph (in-memory on routing servers; also stored in PostGIS)
+nodes (road intersections)
+  node_id   BIGINT PK
+  lat       DOUBLE
+  lng       DOUBLE
+  geohash6  CHAR(6)     -- for spatial filtering
+  INDEX (geohash6)
+
+edges (road segments)
+  edge_id      BIGINT PK
+  from_node    BIGINT FK nodes
+  to_node      BIGINT FK nodes
+  distance_m   INT
+  speed_limit  SMALLINT    -- km/h
+  road_class   ENUM(motorway, trunk, primary, secondary, residential)
+  oneway       BOOLEAN
+  INDEX (from_node)
+
+-- Real-time traffic weights (updated every 1 min from probe data)
+traffic_weights  (Redis sorted set or in-memory on routing servers)
+  edge_id -> current_travel_time_secs (replaces speed_limit * distance)
+
+-- Place index (Elasticsearch)
+places
+  place_id    TEXT
+  name        TEXT (full-text indexed)
+  category    TEXT
+  address     TEXT
+  location    GEO_POINT (lat, lng)
+  rating      FLOAT
+  INDEX: full-text on name, geo on location
+
+-- Driver locations (Redis, NOT persisted to DB for location history)
+Redis GEOADD "drivers:online" lng lat driverId
+Redis GEOPOS / GEORADIUS for proximity queries
+Expire key after driver goes offline (TTL 60s refreshed on each update)
+
+-- Map tiles (object storage + CDN)
+S3/GCS key: tiles/{z}/{x}/{y}/{style}.pbf
+CloudFront CDN: global PoPs serve cached tiles
+TTL: 24h for frequently updated areas; 1 week for static terrain
+```
+
+**5. High-level architecture**
+```
+Mobile App / Browser
+  | Tile requests (static assets)  | API requests (routing, search, location)
+  v                                v
++--------------------+    +-------------------------------------------+
+|  CloudFront CDN    |    |  API Gateway (geo-load-balanced)           |
+|  200+ PoPs globally|    |  Routes to nearest regional cluster       |
+|  Serves 99% tiles  |    +------------------+------------------------+
++--------------------+                       |
+                                             |
+              +------------------------------v--------------------------+
+              |              Regional API Cluster                        |
+              |                                                          |
+              |  +--------------+  +----------------+                   |
+              |  |  Tile Service|  |  Place Search  |                   |
+              |  |  Reads S3    |  |  (Elasticsearch)|                  |
+              |  |  on CDN miss |  +----------------+                   |
+              |  +--------------+                                        |
+              |  +-------------------------------------------------------+|
+              |  |           Routing Service                             ||
+              |  |  Holds full road graph in RAM (3.2 GB)               ||
+              |  |  A* algorithm with real-time traffic weights          ||
+              |  |  Weighted graph updated every 1 min via Redis        ||
+              |  +-------------------------------------------------------+|
+              |  +-------------------------------------------------------+|
+              |  |      Location Service (Driver tracking)               ||
+              |  |  Accepts PUT /drivers/{id}/location                  ||
+              |  |  GEOADD to Redis geospatial index                    ||
+              |  |  Broadcast update to Kafka -> passenger apps         ||
+              |  +-------------------------------------------------------+|
+              +-----------------------------------------------------------+
+                                        |
+              +-------------------------v-------------------------------+
+              |               Data Stores                               |
+              |  Redis Cluster: driver geospatial index (250K writes/s) |
+              |  Elasticsearch: place index (full-text + geo)           |
+              |  PostGIS (PostgreSQL): road graph (source of truth)     |
+              |  S3/GCS: map tiles (10 PB), satellite imagery          |
+              |  ClickHouse: traffic probe analytics                    |
+              +----------------------------------------------------------+
+                                        |
+              +-------------------------v-------------------------------+
+              |                 Offline Pipeline                        |
+              |  OSM / HERE / TomTom -> ETL -> PostGIS + tiles         |
+              |  Traffic probe data (GPS breadcrumbs) -> edge weights  |
+              |  Runs nightly; updated edges pushed to routing servers  |
+              +---------------------------------------------------------+
+```
+
+**6. Deep dive**
+
+**Geohash encoding — worked example**
+Geohash encodes a (lat, lng) pair as a short alphanumeric string where common prefix = geographic proximity. Algorithm: interleave binary representations of longitude and latitude bits, then base32-encode. Example: San Francisco (lat=37.7749, lng=-122.4194). Step 1: lng range [-180, 180]. -122.4194 -> bisect 20 times: 0=[-180,0], 1=[0,180] -> starts with 0 (lng < 0). Continue bisecting: binary string for lng ~= 01001010110110001101. Step 2: lat range [-90, 90]. 37.7749 -> binary ~= 10110001100011011001. Step 3: Interleave (lng bit, lat bit): 001101000101100010... -> first 30 bits. Step 4: Group into 5-bit chunks -> base32 characters. Result: "9q8yy" (level 5, ~4.9 km x 4.9 km). Level 6 ("9q8yyz") -> ~1.2 km x 0.6 km. Level 8 -> ~38 m x 19 m (precise enough for street-level search). For nearby driver search: query geohash at level 6 and the 8 neighboring geohash cells (to avoid boundary misses).
+
+**Geohash vs Quadtree for spatial indexing**
+Geohash: fixed grid cells at each level; cells are rectangular, varying in size by latitude; easy to compute (pure string prefix); stored as indexed column in DB or Redis. Weakness: boundary problem (two nearby points may have very different geohash strings if they straddle a cell boundary — solved by querying 9 cells). Quadtree: adaptive subdivisions — a quad subdivides only when it has more than k points (typically k=100 for a leaf node). This concentrates resolution in dense areas (cities) and keeps coarse resolution for sparse areas (oceans). Better than geohash for highly non-uniform point distributions (like real-world POIs or drivers). S2 geometry (Google): sphere-based, not flat; cells have more uniform areas than geohash; used in production Google Maps for its improved locality guarantees.
+
+**ETA computation with A* on road graph**
+Dijkstra's algorithm finds shortest path in O((V + E) log V). A* adds a heuristic h(v) = straight-line distance(v, destination) / max_speed. This reduces explored nodes from the full graph to a directed frontier toward the destination. For a city-level route: ~10 K nodes explored vs 50 M total. Real-time traffic: instead of distance/speed_limit as edge weight, use current_travel_time (from probe vehicles GPS breadcrumbs averaged over last 5 min). Updated edge weights pushed to routing servers via Redis pub/sub every 60 s. Historical traffic patterns (day-of-week, hour) used when real-time data is sparse (late night).
+
+**7. Data flow** — "Get directions from A to B"
+1. App calls GET /directions?origin=37.77,-122.41&destination=37.33,-121.88&mode=driving.
+2. API Gateway routes to nearest regional Routing Service.
+3. Routing Service: snap origin/destination to nearest road nodes using geospatial index (find node within 100 m radius).
+4. Load current edge weights from Redis (or in-memory cache refreshed every 60 s).
+5. Run A* on road graph: explored ~8,000 nodes, found optimal path. Total route: 22 edges, 12.4 km, 18 min with current traffic.
+6. Encode path as polyline (Google Encoded Polyline Algorithm). Generate turn-by-turn instructions.
+7. Return response. Client decodes polyline, draws route on map tiles.
+8. Client begins navigation: every 5 s, re-evaluate remaining route with updated traffic (re-run A* from current position).
+
+**8. Scaling**
+- **10x routes (7K QPS):** Scale Routing Service horizontally; route servers are stateless (road graph is read-only, loaded from S3 at startup); add more route server instances behind LB.
+- **100x driver updates (25 M/sec):** Partition Redis geospatial index by geographic region (geohash level-4 cells); each Redis node handles a geographic shard; route update to correct shard via consistent hash on driver's current geohash.
+- **1000x (global Google Maps scale):** Geo-distributed clusters (NA, EU, APAC, etc.); road graph partitioned by country/region; routing queries that cross regions use a hierarchical routing algorithm (precompute highway-level routes between partitions, then local routes within).
+
+**9. Trade-offs**
+- **Raster vs vector tiles:** Vector tiles chosen for client-side rendering — smaller size (Protobuf vs PNG), client can rotate/style dynamically, supports accessibility features. Raster tiles simpler to serve but fixed style, larger size, no client customization.
+- **A* vs Dijkstra for routing:** A* always chosen — heuristic dramatically reduces search space (10x fewer nodes explored for typical city routes). Only falls back to Dijkstra when destination is unclear (multi-destination queries).
+- **Redis geo index vs PostGIS for driver locations:** Redis chosen for driver locations — in-memory, sub-millisecond, built-in GEORADIUS; 1 M driver updates/sec is not feasible for PostGIS disk writes. PostGIS is used as the source of truth for road network and places (not for ephemeral driver locations).
+
+**10. Follow-up questions**
+
+**Q: How do you keep map tiles fresh when roads change?**
+A: Map edit pipeline: road changes submitted -> validated -> applied to PostGIS road graph -> trigger tile regeneration for affected tile coordinates at all zoom levels. Tile generation is a batch job (MapReduce over changed areas). Updated tiles are pushed to S3 and CDN cache is invalidated with a versioned URL or `Cache-Control: no-cache` + CDN purge. High-priority changes (new highway) go through an accelerated pipeline; minor changes batched nightly.
+
+**Q: How do you route for very long distances (e.g., cross-country)?**
+A: Hierarchical routing: (1) Precompute a highway-level contracted graph (Contraction Hierarchies algorithm — precompute shortcut edges that bypass intermediate nodes). (2) For long routes: use A* on the contracted highway graph first (fast, thousands of nodes instead of millions); then expand with local roads at origin and destination. Contraction Hierarchies reduce query time from seconds to milliseconds for cross-continent routes.
+
+**Q: How do you handle the "map too big for one server" problem?**
+A: Road graph is partitioned by geographic bounding box (e.g., US West, US East, EU, APAC). Each partition's routing server holds its sub-graph. Cross-partition routing uses a tier-0 router that stitches together routes from partition boundary to partition boundary, then fills in local segments.
+
+**Q: How does ETA account for traffic signals and turns?**
+A: Each edge in the road graph has turn cost metadata: left turn penalty (e.g., 15 s), right turn (5 s), U-turn (60 s), traffic signal (add avg wait time derived from historical probe data for that intersection). These penalties are added to edge weights in A* as the algorithm considers each neighbor node.
+
+---
+
+## 25 — Live Streaming / Twitch
+**Asked at:** Amazon (Twitch), Meta, YouTube  **Difficulty:** 🟡  **Level:** SDE-1/2
+
+**1. Requirements**
+*Functional:*
+- Streamers broadcast live video from a desktop/mobile encoder
+- Viewers can watch live streams with low latency (< 30 s behind live for broadcast; < 3 s for interactive)
+- Video is transcoded to multiple quality levels (1080p, 720p, 480p, 360p) for Adaptive Bitrate (ABR)
+- Live chat: viewers send and receive messages in real time; channel-level fan-out
+- Viewer count displayed on stream; updated every 10 s
+- Stream recording: save VOD (video on demand) for playback after stream ends
+- Stream discovery: browse live channels by category, viewer count, game
+
+*Non-functional:*
+- Scale: 10 M concurrent viewers; 100 K concurrent streamers; peak chat 100 K messages/sec per popular channel
+- Latency: HLS broadcast latency ~20-30 s acceptable; Low-latency HLS ~3-5 s for interactive streams
+- Availability: 99.99% — stream interruption directly impacts streamer revenue
+- Video quality: auto-adapt to viewer bandwidth (ABR); smooth startup < 2 s
+- Storage: 1 TB/hr per 1080p60fps stream; 100 K streamers * 4 hrs avg = 400 PB raw/day (transcode + compress -> ~40 PB/day for HLS segments)
+
+**2. Back-of-envelope estimation**
+- 100 K streamers; avg bitrate 6 Mbps ingest = 600 Gbps ingest bandwidth
+- Transcoded output: 4 quality levels * avg 3 Mbps = 12 Mbps per stream * 100 K streams = 1.2 Tbps transcoder output bandwidth
+- Viewer bandwidth: 10 M viewers * avg 4 Mbps = 40 Tbps outbound — must be CDN-served; cannot come from origin
+- HLS segment: 2-second segments; 10 M viewers requesting new segment every 2 s = 5 M requests/sec — CDN handles this easily
+- Chat: 100 K messages/sec across all channels; avg message 200 bytes = 20 MB/sec; fan-out: avg channel 1K viewers receiving each message = 100 M message deliveries/sec
+- Viewer count: 10 M concurrent viewers across 100 K channels; update every 10 s = 1 M updates/sec to viewer counter service
+- VOD storage: 100 K streamers * 4 hrs * 1.5 GB/hr (compressed) = 600 TB/day
+
+**3. API design**
+```
+# Streamer starts broadcasting (returns RTMP ingest URL)
+POST /v1/streams
+Headers: Authorization: Bearer <streamer_token>
+Body: { title, categoryId, language, lowLatencyMode:true }
+Response: { streamId, rtmpUrl:"rtmp://ingest.twitch.tv/live/{stream_key}", playbackUrl }
+
+# Get stream info
+GET /v1/streams/{streamId}
+Response: { streamId, title, streamerId, viewerCount, startedAt, category, hlsUrl }
+
+# Browse live streams
+GET /v1/streams?category=gaming&sort=viewer_count&limit=20&cursor=...
+Response: { streams:[...], nextCursor }
+
+# Chat: send message
+POST /v1/streams/{streamId}/chat
+Body: { message: "PogChamp", emoticons:["PogChamp"] }
+Response: 202 Accepted
+
+# Chat: WebSocket subscription
+WS  /v1/streams/{streamId}/chat/ws
+RECV: { userId, username, message, badges, timestamp, color }
+
+# VOD playback
+GET /v1/vods/{vodId}
+Response: { vodId, hlsUrl, duration, recordedAt, thumbnailUrl }
+```
+
+**4. Data model / schema**
+```
+-- Stream metadata (PostgreSQL)
+streams
+  stream_id     UUID PK
+  streamer_id   UUID FK users
+  title         TEXT
+  category_id   UUID FK categories
+  status        ENUM(live, ended)
+  started_at    TIMESTAMPTZ
+  ended_at      TIMESTAMPTZ
+  rtmp_key      TEXT UNIQUE    -- secret ingest key
+  vod_id        UUID FK vods   -- populated when stream ends
+  INDEX (status, started_at DESC) for discovery
+  INDEX (category_id, status)
+
+-- Chat messages (Cassandra, append-only)
+chat_messages
+  stream_id   UUID  (partition key)
+  sent_at     TIMEUUID (clustering key, DESC)
+  user_id     UUID
+  username    TEXT
+  message     TEXT
+  badges      LIST<TEXT>
+  color       TEXT
+  PRIMARY KEY ((stream_id), sent_at)  -- range query: last N messages
+
+-- Viewer count (Redis)
+INCR  "viewers:{streamId}"    -- on join
+DECR  "viewers:{streamId}"    -- on leave
+GET   "viewers:{streamId}"    -- for display (updated every 10s snapshot to DB)
+
+-- HLS segments (S3 / GCS)
+  Key: segments/{streamId}/{rendition}/{sequenceNum}.ts
+  Playlist: segments/{streamId}/master.m3u8
+             segments/{streamId}/1080p/playlist.m3u8
+             segments/{streamId}/720p/playlist.m3u8  ...
+
+-- VOD metadata
+vods
+  vod_id        UUID PK
+  stream_id     UUID FK streams
+  hls_url       TEXT    -- points to final assembled HLS on S3
+  duration_secs INT
+  size_bytes    BIGINT
+  created_at    TIMESTAMPTZ
+```
+
+**5. High-level architecture**
+```
+Streamer (OBS / mobile encoder)
+    | RTMP stream (video + audio)
+    v
++------------------------------------------------------------------+
+|               RTMP Ingest Service (100K+ connections)             |
+|  * Authenticates stream_key                                       |
+|  * Accepts RTMP connection; buffers incoming video chunks         |
+|  * Pushes raw stream to Transcoder queue (Kafka or direct)       |
+|  * Geo-distributed ingest PoPs to minimize streamer upload lag   |
++-------------------------+-----------------------------------------+
+                          | raw video chunks
+                          v
++------------------------------------------------------------------+
+|                   Transcoder Fleet                                |
+|  * FFmpeg-based workers (GPU-accelerated)                        |
+|  * Input: raw H.264/HEVC stream                                  |
+|  * Output: HLS segments at 1080p60, 720p60, 480p30, 360p30      |
+|  * Segment duration: 2 s (standard HLS) or 0.5 s (LL-HLS)      |
+|  * Pushes segments to S3; updates HLS playlist files            |
+|  * One transcoder per active stream (dedicated or shared)       |
++-------------------------+-----------------------------------------+
+                          | HLS segments -> S3
+                          v
++------------------------------------------------------------------+
+|                 S3 / Object Storage (Origin)                      |
+|  Stores HLS .ts segment files + .m3u8 playlist files             |
+|  Playlist files updated every 2 s (new segment appended)        |
+|  CDN pulls from here on cache miss                               |
++-------------------------+-----------------------------------------+
+                          | CDN pull
+                          v
++------------------------------------------------------------------+
+|             CDN (Akamai / CloudFront, 200+ PoPs globally)        |
+|  Caches .ts segment files (popular segments served from edge)    |
+|  Playlist (.m3u8) cached for 2 s only (must stay fresh)         |
+|  Viewers pull from nearest CDN PoP                               |
+|  10 M viewers @ 40 Tbps — CDN absorbs all bandwidth             |
++-------------------------+-----------------------------------------+
+                          | HLS playback (HTTP byte-range)
+                          v
+                  Viewer (HLS player, ABR)
+                  Requests new playlist every 2 s
+                  Downloads next segment
+                  Auto-adjusts quality based on bandwidth
+
+CHAT SYSTEM (separate path):
+Viewer --WS--> Chat Gateway (100s of servers) ---> Redis Pub/Sub (per channel)
+                                               +--> Cassandra (persist messages)
+Chat Gateway subscribes to channel's Redis pub/sub topic
+Fan-out: Viewer sends -> Chat Gateway -> Redis PUBLISH -> all other Chat Gateways
+         subscribed to same channel -> forward to their WS connections
+
+VIEWER COUNT:
+Chat Gateway INCR/DECR Redis counter on join/leave
+Viewer Count Service reads Redis every 10s -> broadcasts to streamers + CDN metadata
+```
+
+**6. Deep dive**
+
+**RTMP ingest -> HLS transcoding pipeline**
+RTMP (Real-Time Messaging Protocol) is a low-latency TCP-based protocol used by encoders (OBS Studio) to push live video to ingest servers. It carries H.264 video + AAC audio in interleaved chunks. The Ingest Service receives these, authenticates the stream key, and immediately forwards to the Transcoder. The Transcoder (FFmpeg with NVENC GPU acceleration) reads the incoming stream in real time. It produces multiple output renditions simultaneously (same input, multiple output resolutions/bitrates). Every 2 seconds, it finalizes a segment (.ts file — MPEG-TS container) for each rendition and uploads to S3. It then updates the HLS master playlist (master.m3u8) and per-rendition playlists (e.g., 1080p/playlist.m3u8) to include the new segment. The playlist is a rolling window of the last 5 segments (10 s of buffer). Viewer players poll the playlist every 2 s, download the newest segment not yet played.
+
+**Adaptive Bitrate (ABR) streaming**
+The HLS player measures download throughput continuously. If the last segment downloaded at 8 Mbps and the current rendition requires 6 Mbps -> stay at 1080p. If bandwidth drops to 3 Mbps -> switch to 720p (4 Mbps). Segment boundaries are switching points. The master playlist lists all renditions with their bandwidth and resolution — the player chooses. This ensures smooth playback on variable network connections (mobile users, congested networks) without buffering.
+
+**Chat at scale — fan-out via pub/sub**
+A popular streamer has 500 K concurrent viewers all watching the same channel. When one viewer sends a chat message: (1) HTTP POST to Chat Gateway. (2) Chat Gateway publishes to Redis pub/sub channel "chat:{streamId}". (3) All Chat Gateway instances subscribed to this channel receive the message. (4) Each instance forwards to its connected WebSocket clients. Fan-out = 1 publish -> N gateway instances -> M viewers per instance. For 500 K viewers across 500 gateway instances = 1000 viewers/instance -> 1 publish fans out to 500 instances -> each forwards to 1000 WS connections. Redis pub/sub handles this at ~100 K messages/sec per channel. For mega-events (1 M+ viewers): use a hierarchical pub/sub or dedicate Redis nodes per channel.
+
+**Viewer count aggregation — HyperLogLog**
+Exact viewer counting at scale (10 M concurrent across 100 K channels) is memory-intensive if using exact sets. HyperLogLog (HLL) provides approximate distinct count using O(1.5 KB) memory per counter with ~0.81% standard error. For Twitch's use case: Redis PFADD "viewers_hll:{streamId}" userId on each join; PFCOUNT "viewers_hll:{streamId}" for current count. This handles de-duplication (same user on two devices counted once) and gives accurate approximate counts for large streams. For small streams (<1K viewers), exact INCR/DECR counters are fine.
+
+**7. Data flow** — Viewer watching a live stream
+1. Viewer opens stream page. Browser requests GET /v1/streams/{streamId} -> gets hlsUrl.
+2. HLS player fetches master.m3u8 from CDN (Cache-Control: max-age=2). Gets list of renditions.
+3. Player selects 1080p initially. Fetches 1080p/playlist.m3u8 (CDN-cached for 2 s). Gets last 5 segment URLs.
+4. Player fetches the 3 newest .ts segments it hasn't played. These are ~6 s of video. Begins playback.
+5. Every 2 s: player refetches playlist. New segment at the end. Downloads it. Smooth continuous playback.
+6. Viewer's bandwidth drops. Player detects segment download time exceeds segment duration. Switches to 720p. Requests 720p/playlist.m3u8.
+7. Viewer opens chat. WS connection to Chat Gateway. Gateway subscribes to Redis "chat:{streamId}".
+8. Another viewer types a message. POST to Chat Gateway -> Redis PUBLISH -> viewer's Chat Gateway receives -> forwards over WS -> viewer sees message in < 200 ms.
+9. Viewer joins: Chat Gateway increments Redis "viewers:{streamId}". Viewer Count Service reads counter every 10 s and pushes update to Streamer's dashboard via WS.
+
+**8. Scaling**
+- **10x streamers (1 M):** Scale Ingest Service horizontally (each server handles ~500 concurrent streams); scale Transcoder fleet with auto-scaling based on active stream count; S3 scales automatically; CDN scales automatically.
+- **100x viewers (1 B):** CDN handles it — add more PoPs; optimize segment size (2 s standard) for high cache hit rate; pre-warm CDN for scheduled events (predictable load).
+- **100x chat (10 M messages/sec):** Partition Redis pub/sub by channel; introduce message rate limiting per channel per user; for mega-events, switch to dedicated real-time messaging clusters (Ably, Pusher at scale); drop messages gracefully under extreme load (viewers accept occasional missed chat messages).
+
+**9. Trade-offs**
+- **HLS vs WebRTC for delivery:** HLS chosen for broadcast (> 30 s latency acceptable for most streams; CDN-friendly, scales to billions of viewers). WebRTC chosen for interactive/low-latency streams (< 1 s latency, peer-to-peer or SFU, harder to scale to millions). Twitch uses Low-Latency HLS as a middle ground (~3 s with 0.5 s segments).
+- **RTMP vs SRT for ingest:** RTMP is widely supported (all encoders); SRT (Secure Reliable Transport) is newer, handles packet loss better, preferred for unstable connections. Twitch supports both; OBS defaults to RTMP.
+- **Redis pub/sub vs Kafka for chat fan-out:** Redis pub/sub is simpler and lower latency (< 10 ms) but no persistence and no replay. Kafka provides durability and replay but adds latency. Chat messages are written to Cassandra for history, so Redis pub/sub for live fan-out is sufficient — it's fire-and-forget for real-time delivery; Cassandra is the durable store.
+
+**10. Follow-up questions**
+
+**Q: How do you handle a streamer's encoder disconnecting mid-stream?**
+A: Ingest Service detects TCP disconnect. Marks stream as buffering. Holds a 60-second reconnect window — streamer's encoder reconnects and stream resumes. If no reconnect within 60 s, stream is marked as ended. Transcoder flushes its segment buffer, finalizes the HLS playlist with an `#EXT-X-ENDLIST` tag. VOD assembly begins automatically from the recorded segments.
+
+**Q: How do you record a VOD while live streaming simultaneously?**
+A: The Transcoder writes segments to S3 in real time. A parallel VOD Assembler watches the S3 prefix for the stream, collecting all .ts segments as they appear. When the stream ends, it creates the final VOD .m3u8 playlist pointing to all segments in order. No post-processing step required — segments are already transcoded. The VOD is available within seconds of stream end.
+
+**Q: How do you handle chat moderation at scale?**
+A: (1) Client-side: browser filters known bad words. (2) Server-side: ML classifier scores each message in < 50 ms before fan-out. (3) AutoMod: pre-configured word/phrase block lists per channel. (4) Timeout system: moderators (humans) can ban/timeout users; ban list stored in Redis per channel; Chat Gateway checks on each message. (5) Rate limiting: max 1 message per second per user per channel (Redis token bucket).
+
+**Q: How would you implement a "clip" feature (clip last 30 s of a stream)?**
+A: HLS segments are already stored in S3. A clip is created by identifying the last ~15 segments (30 s at 2 s/segment). The Clip Service creates a new .m3u8 playlist file referencing those 15 segments (no re-encoding needed — segments are already transcoded). The clip URL points to this playlist. Clips are stored permanently as VODs in S3. Total clip creation time: < 1 s (just a new playlist file write).
+
+---
+
+## Design Trade-off Cheat Sheet
+
+| Problem | Key decision | Choice | Why |
+|---|---|---|---|
+| Social feed | Fanout-on-write vs fanout-on-read | Write for <=10K followers; read for celebrities | Write keeps read fast; read avoids amplifying celebrity posts |
+| Chat | Storage model | Append-only message table sharded by conversation_id | Chat is write-heavy; reads are always recent; sharding by convo keeps related data together |
+| Search/Autocomplete | Trie vs search DB | Trie in memory for <10M terms; Elasticsearch otherwise | Trie is O(L) prefix lookup but hard to distribute; ES scales horizontally |
+| Payments | Consistency model | Strong (ACID, single-region DB) | Money: never sacrifice correctness for availability |
+| Notifications | Delivery guarantee | At-least-once + idempotent receivers | Best-effort loses messages; exactly-once is too expensive at scale |
+| Cache | Eviction policy | LRU for access-frequency workloads, LFU for skewed hotspot workloads | LRU evicts things not used recently; LFU keeps truly popular items |
+| URL shortener | DB choice | SQL (PostgreSQL) | Simple key-value but need ACID; Postgres with a single table is fine until 10B URLs |
+| Video streaming | CDN strategy | Pull CDN with long TTL for popular; bypass CDN for live | Popular VOD benefits from caching; live can't be cached meaningfully |
+| Ride sharing | Location store | Redis GEOADD (in-memory geo index) | Sub-millisecond proximity queries; persistence via AOF |
+| Rate limiter | Algorithm | Sliding window counter (Redis + Lua) | Fixed window has boundary spikes; token bucket requires per-user state; sliding window is the best balance |
+
+---
+
+Created **08-system-design-problems.md** — 25 designs covered (8 easy, 12 medium, 5 hard), each with requirements, estimation with real arithmetic, API design, schema with sharding key, full ASCII architecture diagram, deep dives into critical components, step-by-step data flow, scaling strategy up to 1000x, trade-off analysis, and follow-up Q&A.

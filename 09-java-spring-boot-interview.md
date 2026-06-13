@@ -5288,3 +5288,1618 @@ public void process() throws IOException {
 - Putting @Transactional on private methods — silently ignored.
 
 ---
+
+### Q71: Spring Data JPA — N+1 Problem
+**Company:** Amazon, Flipkart, Microsoft  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥🔥  **Round:** Onsite
+
+**Question:** Explain Spring Data JPA repository hierarchy and query derivation. What is the N+1 problem and how do you fix it?
+
+**What interviewer is testing:** Whether you can detect and fix the single most common JPA performance bug — mandatory knowledge for any backend developer using Spring Boot.
+
+**Ideal Answer:**
+
+**Repository hierarchy:**
+
+```
+Repository (marker)
+  └── CrudRepository<T,ID>   — save, findById, findAll, delete, count
+        └── PagingAndSortingRepository<T,ID>   — findAll(Pageable), findAll(Sort)
+              └── JpaRepository<T,ID>  — flush, saveAndFlush, deleteInBatch
+```
+
+**Query derivation:**
+
+```java
+public interface OrderRepository extends JpaRepository<Order, Long> {
+    List<Order> findByCustomerIdAndStatus(Long customerId, OrderStatus status);
+    // → SELECT o FROM Order o WHERE o.customerId = ?1 AND o.status = ?2
+
+    Page<Order> findByStatusOrderByCreatedAtDesc(OrderStatus status, Pageable pageable);
+
+    @Query("SELECT o FROM Order o WHERE o.totalAmount > :amount")
+    List<Order> findHighValueOrders(@Param("amount") BigDecimal amount);
+}
+```
+
+**N+1 problem:**
+
+```java
+// 1 query to load all orders, then 1 query PER order to load customer
+List<Order> orders = orderRepo.findAll();          // SELECT * FROM orders
+for (Order o : orders) {
+    System.out.println(o.getCustomer().getName()); // SELECT * FROM customers WHERE id=?
+}
+// For 1000 orders = 1001 queries
+```
+
+**Fix 1 — JOIN FETCH:**
+
+```java
+@Query("SELECT o FROM Order o JOIN FETCH o.customer WHERE o.status = :status")
+List<Order> findWithCustomer(@Param("status") OrderStatus status);
+// One query with JOIN — fetches all data
+```
+
+**Fix 2 — @EntityGraph:**
+
+```java
+@EntityGraph(attributePaths = {"customer", "items"})
+List<Order> findByStatus(OrderStatus status);
+// Spring Data generates JOIN FETCH for specified associations
+```
+
+**Fix 3 — Batch size:**
+
+```java
+@OneToMany(mappedBy = "customer", fetch = FetchType.LAZY)
+@BatchSize(size = 50)  // Hibernate loads 50 customers' orders in one IN() query
+private List<Order> orders;
+// or globally: spring.jpa.properties.hibernate.default_batch_fetch_size=50
+```
+
+**Fix 4 — DTO projection (most efficient):**
+
+```java
+public interface OrderSummary {
+    Long getId();
+    String getCustomerName();
+    BigDecimal getTotalAmount();
+}
+
+@Query("SELECT o.id as id, c.name as customerName, o.totalAmount as totalAmount " +
+       "FROM Order o JOIN o.customer c WHERE o.status = :status")
+List<OrderSummary> findSummaryByStatus(@Param("status") OrderStatus status);
+// Fetches only needed columns, no entity instantiation
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"JOIN FETCH vs @EntityGraph?"* → Functionally equivalent. `@EntityGraph` is more reusable across methods; `JOIN FETCH` is more explicit and flexible for complex queries.
+
+2. *"Can JOIN FETCH cause issues with Pageable?"* → Yes — Hibernate applies pagination IN MEMORY (fetches all rows, then paginates). Fix: two-query approach — first paginate IDs, then fetch full entities by ID.
+
+3. *"Why is `FetchType.EAGER` not the fix?"* → You trade lazy N+1 for eager N+1 and add cost to queries that don't need the association. Always prefer `LAZY`, fix with JOIN FETCH or @EntityGraph on specific queries.
+
+**Common mistakes that get you rejected:**
+- Switching to `FetchType.EAGER` to fix N+1.
+- JOIN FETCH with `Pageable` — in-memory pagination.
+- No SQL logging in dev — N+1 hits production with 100k rows.
+
+---
+
+### Q72: Spring MVC Request Lifecycle
+**Company:** Amazon, Microsoft, Adobe  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥  **Round:** Onsite
+
+**Question:** Walk through the 7-step DispatcherServlet request lifecycle.
+
+**What interviewer is testing:** Whether you understand the MVC infrastructure — essential for debugging request handling and writing interceptors.
+
+**Ideal Answer:**
+
+```
+HTTP Request
+  │
+  ▼
+1. DispatcherServlet.doDispatch()      — front controller, single entry point
+  │
+  ▼
+2. HandlerMapping.getHandler()         — finds controller method for URL+method
+   Returns HandlerExecutionChain (handler + interceptors)
+  │
+  ▼
+3. HandlerInterceptor.preHandle()      — auth check, logging, rate limiting
+   Returns false → request aborted
+  │
+  ▼
+4. HandlerAdapter.handle()             — resolves @RequestParam, @RequestBody,
+   invokes controller method, handles return value (@ResponseBody → JSON)
+  │
+  ▼
+5. HandlerInterceptor.postHandle()     — after handler, before view render
+  │
+  ▼
+6. ViewResolver.resolveViewName()      — converts view name → View object
+   For REST: skipped — HttpMessageConverter writes JSON directly
+  │
+  ▼
+7. HandlerInterceptor.afterCompletion() — cleanup, always runs (even on exception)
+  │
+  ▼
+HTTP Response
+```
+
+**Filter vs Interceptor:**
+
+```
+Servlet Filter:     runs BEFORE DispatcherServlet — raw HttpServletRequest
+                    Use: CORS, Spring Security, request logging
+HandlerInterceptor: runs INSIDE DispatcherServlet — aware of handler/model
+                    Use: auth checks needing to know the endpoint, request tracking
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Where does @ControllerAdvice fit?"* → When the handler throws an exception, `ExceptionHandlerExceptionResolver` catches it after step 4 and routes to an `@ExceptionHandler` in `@ControllerAdvice`.
+
+2. *"How does @ResponseBody work?"* → `HandlerAdapter` finds a `HttpMessageConverter` matching the return type and Accept header, writes directly to `HttpServletResponse`. View resolution is bypassed.
+
+**Common mistakes that get you rejected:**
+- Confusing Filters (servlet-level) with Interceptors (Spring-level).
+- Not knowing where exception handling fits in the lifecycle.
+
+---
+
+### Q73: Spring Security Filter Chain
+**Company:** Amazon, Flipkart, Goldman Sachs  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥🔥  **Round:** Onsite
+
+**Question:** Explain the Spring Security filter chain. How do you place a JWT filter correctly? How do you configure an OAuth2 resource server?
+
+**What interviewer is testing:** Practical Spring Security configuration — filter order and the security config DSL.
+
+**Ideal Answer:**
+
+Spring Security registers a `DelegatingFilterProxy` that delegates to the `SecurityFilterChain` — an ordered list of Filters.
+
+**JWT filter placement:**
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    private final JwtAuthFilter jwtAuthFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/**").permitAll()
+                .requestMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated())
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+}
+
+@Component
+public class JwtAuthFilter extends OncePerRequestFilter {
+    private final JwtService jwtService;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res,
+                                     FilterChain chain) throws ServletException, IOException {
+        String authHeader = req.getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            chain.doFilter(req, res); return;
+        }
+        String token = authHeader.substring(7);
+        String username = jwtService.extractUsername(token);
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails user = userDetailsService.loadUserByUsername(username);
+            if (jwtService.isTokenValid(token, user)) {
+                UsernamePasswordAuthenticationToken auth =
+                    new UsernamePasswordAuthenticationToken(user, null, user.getAuthorities());
+                auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(req));
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        }
+        chain.doFilter(req, res);
+    }
+}
+```
+
+**OAuth2 Resource Server:**
+
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.oauth2ResourceServer(o -> o.jwt(j -> j.jwtAuthenticationConverter(converter())))
+        .authorizeHttpRequests(a -> a.anyRequest().authenticated());
+    return http.build();
+}
+// Spring Security validates JWT signature, expiry, issuer automatically
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"@PreAuthorize vs antMatchers?"* → `antMatchers` authorizes at filter level before controller. `@PreAuthorize` runs method security after reaching the controller. Use URL rules for coarse-grained, `@PreAuthorize` for fine-grained.
+
+2. *"How does Spring Security store the authenticated user?"* → `SecurityContextHolder` (ThreadLocal). Cleared after each request.
+
+**Common mistakes that get you rejected:**
+- JWT filter AFTER `UsernamePasswordAuthenticationFilter` — auth decided before your filter.
+- Not disabling CSRF for stateless REST — POST/PUT/DELETE rejected with 403.
+- Not calling `chain.doFilter(req, res)` — request never processed.
+
+---
+
+### Q74: @ControllerAdvice and Exception Handling
+**Company:** Amazon, Microsoft  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥  **Round:** Phone/Onsite
+
+**Question:** How do you implement global exception handling in Spring? Explain ProblemDetail (RFC 7807).
+
+**What interviewer is testing:** Production-quality error handling — consistent, informative API error responses.
+
+**Ideal Answer:**
+
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    @ExceptionHandler(OrderNotFoundException.class)
+    public ProblemDetail handleOrderNotFound(OrderNotFoundException ex, HttpServletRequest req) {
+        ProblemDetail p = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+        p.setTitle("Order Not Found");
+        p.setInstance(URI.create(req.getRequestURI()));
+        p.setProperty("orderId", ex.getOrderId());
+        return p;
+    }
+
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(
+        MethodArgumentNotValidException ex, HttpHeaders headers,
+        HttpStatusCode status, WebRequest request) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors()
+          .forEach(e -> errors.put(e.getField(), e.getDefaultMessage()));
+        ProblemDetail p = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+        p.setTitle("Validation Failed");
+        p.setProperty("errors", errors);
+        return ResponseEntity.badRequest().body(p);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail handleUnexpected(Exception ex, HttpServletRequest req) {
+        log.error("Unexpected error at {}", req.getRequestURI(), ex);
+        return ProblemDetail.forStatusAndDetail(
+            HttpStatus.INTERNAL_SERVER_ERROR,
+            "An unexpected error occurred. Contact support if the problem persists.");
+    }
+}
+```
+
+ProblemDetail (RFC 7807) JSON:
+```json
+{
+  "type": "https://api.example.com/errors/order-not-found",
+  "title": "Order Not Found",
+  "status": 404,
+  "detail": "Order with ID 12345 was not found",
+  "instance": "/api/orders/12345",
+  "orderId": 12345
+}
+```
+
+Content-Type: `application/problem+json`.
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"@ExceptionHandler in controller vs @ControllerAdvice?"* → In controller: handles exceptions from that controller only. In `@ControllerAdvice`: global — handles from all controllers.
+
+2. *"Exceptions thrown in filters?"* → Filters run before the Spring MVC dispatcher — `@ControllerAdvice` can't catch them. Write the error response directly in the filter, or register an error-handling filter.
+
+**Common mistakes that get you rejected:**
+- Exposing stack traces in error responses (security risk).
+- Inconsistent error format across endpoints.
+- Not logging in the catch-all handler.
+
+---
+
+### Q75: Spring Boot Testing
+**Company:** Amazon, Google, Microsoft  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥🔥  **Round:** Onsite
+
+**Question:** Compare `@SpringBootTest`, `@WebMvcTest`, `@DataJpaTest`. When do you use `@MockBean` vs `@SpyBean`? Explain Testcontainers.
+
+**What interviewer is testing:** Test strategy — knowing which slice to use and why.
+
+**Ideal Answer:**
+
+```
+@SpringBootTest     — FULL ApplicationContext; use for integration tests
+@WebMvcTest         — web layer only (controllers, security, filters); @Service/@Repository need @MockBean
+@DataJpaTest        — JPA layer only (entities, repositories); @Service/@Controller not loaded
+```
+
+**@WebMvcTest:**
+
+```java
+@WebMvcTest(OrderController.class)
+class OrderControllerTest {
+    @Autowired MockMvc mockMvc;
+    @MockBean  OrderService orderService;
+
+    @Test
+    void getOrder_returns200() throws Exception {
+        given(orderService.findById(1L)).willReturn(new Order(1L, "pending"));
+        mockMvc.perform(get("/api/orders/1").accept(MediaType.APPLICATION_JSON))
+               .andExpect(status().isOk())
+               .andExpect(jsonPath("$.status").value("pending"));
+    }
+}
+```
+
+**@MockBean vs @SpyBean:**
+
+```java
+@MockBean  OrderService orderService;
+// Full Mockito mock — all methods return null/0/false by default
+// Use to isolate the component under test
+
+@SpyBean  OrderService orderService;
+// Wraps the REAL Spring bean — real methods execute unless stubbed
+// Use when you want most real behavior but need to stub/verify specific methods
+```
+
+**@DataJpaTest with Testcontainers:**
+
+```java
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = Replace.NONE)
+@Testcontainers
+class OrderRepositoryTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:15").withDatabaseName("testdb");
+
+    @DynamicPropertySource
+    static void overrideProps(DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url",      postgres::getJdbcUrl);
+        r.add("spring.datasource.username", postgres::getUsername);
+        r.add("spring.datasource.password", postgres::getPassword);
+    }
+
+    @Autowired OrderRepository orderRepo;
+
+    @Test @Transactional
+    void findByStatus_returnsMatchingOrders() {
+        orderRepo.save(new Order(null, "PENDING"));
+        assertThat(orderRepo.findByStatus("PENDING")).hasSize(1);
+    }
+}
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Why Testcontainers over H2?"* → H2 dialect differs from PostgreSQL/MySQL — queries that work on H2 fail in production. Testcontainers runs the real database engine.
+
+2. *"How to share a container across test classes?"* → `@Container static` on a superclass, or use `@ServiceConnection` (Spring Boot 3.1+) — one container per JVM.
+
+**Common mistakes that get you rejected:**
+- Using `@SpringBootTest` for unit tests — overkill, slow.
+- Not resetting mocked state between tests — test pollution.
+
+---
+
+### Q76: Spring Boot Actuator and Micrometer
+**Company:** Amazon, Flipkart  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥  **Round:** Onsite
+
+**Question:** What does Spring Boot Actuator provide? How do you write a custom health indicator and expose metrics to Prometheus?
+
+**What interviewer is testing:** Operational awareness — how to make services observable in production.
+
+**Ideal Answer:**
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,loggers,threaddump
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+```
+
+**Key endpoints:**
+
+```
+/actuator/health      — UP/DOWN with component detail
+/actuator/metrics     — Micrometer metric names
+/actuator/prometheus  — Prometheus scrape format
+/actuator/loggers     — view/change log levels at runtime (no restart)
+/actuator/threaddump  — JVM thread dump
+/actuator/heapdump    — heap dump download (binary — restrict access!)
+```
+
+**Custom HealthIndicator:**
+
+```java
+@Component
+public class PaymentGatewayHealthIndicator implements HealthIndicator {
+    private final PaymentGatewayClient client;
+
+    @Override
+    public Health health() {
+        try {
+            return client.ping()
+                ? Health.up().withDetail("gateway", "Stripe").build()
+                : Health.down().withDetail("reason", "ping failed").build();
+        } catch (Exception ex) {
+            return Health.down(ex).build();
+        }
+    }
+}
+// Appears at /actuator/health as "paymentGateway" component
+```
+
+**Custom Micrometer metrics:**
+
+```java
+@Service
+public class OrderService {
+    private final Counter orderCounter;
+    private final Timer orderTimer;
+
+    public OrderService(MeterRegistry registry, OrderRepository repo) {
+        this.orderCounter = Counter.builder("orders.placed")
+            .tag("env", "production").register(registry);
+        this.orderTimer = Timer.builder("orders.processing.time").register(registry);
+        Gauge.builder("orders.pending.count", repo, r -> r.countByStatus("PENDING"))
+             .register(registry);
+    }
+
+    public Order placeOrder(Order order) {
+        orderCounter.increment();
+        return orderTimer.record(() -> processOrder(order));
+    }
+}
+// Prometheus output:
+// orders_placed_total{env="production"} 1234.0
+// orders_processing_time_seconds_sum 45.6
+// orders_pending_count 89.0
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"How do you secure actuator endpoints?"* → Restrict `/actuator/**` to `ROLE_ACTUATOR` or internal network. Expose only `health` and `info` publicly. Never expose `/heapdump` publicly.
+
+2. *"What is Micrometer?"* → A metrics facade (like SLF4J for logging). Your code uses the Micrometer API; the backend (Prometheus, Datadog, CloudWatch) is pluggable via dependency swap.
+
+**Common mistakes that get you rejected:**
+- Exposing all actuator endpoints publicly in production — `/heapdump` downloads the full heap.
+- Not tagging metrics — metrics without `env`, `service`, `region` tags are unusable in Grafana.
+
+---
+
+### Q77: Spring Boot 3.x Changes
+**Company:** Google, Amazon  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥  **Round:** Onsite
+
+**Question:** What changed in Spring Boot 3.x? Explain Jakarta EE migration, GraalVM native image, and declarative HTTP clients.
+
+**What interviewer is testing:** Whether you are current with Spring Boot 3 and can articulate migration impacts.
+
+**Ideal Answer:**
+
+**Jakarta EE 10 namespace (Spring Boot 3.0):**
+
+```
+Spring Boot 2.x: javax.* (javax.servlet, javax.persistence, javax.validation)
+Spring Boot 3.x: jakarta.* (jakarta.servlet, jakarta.persistence, jakarta.validation)
+Every import javax.servlet.* → import jakarta.servlet.*
+Third-party libraries must also be Jakarta-compatible.
+```
+
+**GraalVM Native Image:**
+
+```bash
+./mvnw -Pnative native:compile  # build native binary
+# Result: startup ~50ms (vs 3-5s JVM), RSS ~50MB (vs 200-500MB)
+# Trade-off: no dynamic class loading, slightly lower sustained throughput than JIT
+```
+
+Spring AOT processing generates source code for bean definitions at build time — no runtime reflection.
+
+**RestClient (Spring Boot 3.2) — modern RestTemplate replacement:**
+
+```java
+@Bean
+public RestClient restClient(RestClient.Builder builder) {
+    return builder.baseUrl("https://api.example.com").build();
+}
+// Synchronous, fluent API
+Order order = restClient.get().uri("/orders/{id}", id)
+    .retrieve().body(Order.class);
+```
+
+**Declarative HTTP clients (Spring Boot 3.2):**
+
+```java
+@HttpExchange("https://api.example.com")
+public interface PaymentClient {
+    @GetExchange("/payments/{id}")   Payment getPayment(@PathVariable String id);
+    @PostExchange("/payments")       Payment createPayment(@RequestBody PaymentRequest r);
+}
+```
+
+**Other notable changes:**
+- `spring.threads.virtual.enabled=true` — Tomcat uses virtual threads (Boot 3.2).
+- `@ServiceConnection` — Testcontainers auto-configures datasource from container (no `@DynamicPropertySource`).
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"RestTemplate vs WebClient vs RestClient?"* → `RestTemplate`: synchronous, effectively deprecated. `WebClient`: reactive, non-blocking, verbose for simple cases. `RestClient` (3.2): synchronous, fluent — modern `RestTemplate` replacement.
+
+2. *"Native image trade-offs?"* → Native: fast startup, low memory — ideal for serverless/CLIs. JVM: higher peak throughput (JIT), better tooling (heap dumps, JFR), dynamic class loading. Use JVM for long-running services under sustained load.
+
+**Common mistakes that get you rejected:**
+- Not knowing `javax` → `jakarta` migration.
+- Thinking native image is always better.
+
+---
+
+### Q78: Resilience4j
+**Company:** Amazon, Flipkart, Razorpay  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥  **Round:** Onsite
+
+**Question:** Explain Resilience4j Circuit Breaker states. How do you configure Retry, RateLimiter, and Bulkhead?
+
+**What interviewer is testing:** Resilience patterns for microservices — every product company interview with distributed systems asks this.
+
+**Ideal Answer:**
+
+**Circuit Breaker states:**
+
+```
+CLOSED  ─── failure rate > threshold ──► OPEN (all calls fail-fast)
+  ▲                                         │
+  └── probe succeeds ── HALF_OPEN ◄── wait duration expires
+                       (1 call allowed;
+                        success→CLOSED, failure→OPEN)
+```
+
+**Spring Boot YAML configuration:**
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        failureRateThreshold: 50
+        slidingWindowSize: 10
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 3
+  retry:
+    instances:
+      paymentService:
+        maxAttempts: 3
+        waitDuration: 500ms
+        exponentialBackoffMultiplier: 2   # 500ms, 1s, 2s
+        retryExceptions: [java.io.IOException]
+        ignoreExceptions: [com.example.ValidationException]
+  ratelimiter:
+    instances:
+      paymentService:
+        limitForPeriod: 100
+        limitRefreshPeriod: 1s
+        timeoutDuration: 0ms
+  bulkhead:
+    instances:
+      paymentService:
+        maxConcurrentCalls: 20
+        maxWaitDuration: 10ms
+```
+
+**Java usage with fallback:**
+
+```java
+@CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+@Retry(name = "paymentService")
+@RateLimiter(name = "paymentService")
+@Bulkhead(name = "paymentService")
+public PaymentResult processPayment(PaymentRequest request) {
+    return gatewayClient.process(request);
+}
+
+public PaymentResult paymentFallback(PaymentRequest request, Exception ex) {
+    log.warn("Payment gateway unavailable: {}", ex.getMessage());
+    return PaymentResult.queued(request.getId());
+}
+```
+
+**Annotation stacking order (outermost first):**
+
+```
+Bulkhead → RateLimiter → CircuitBreaker → Retry → TimeLimiter → actual call
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Bulkhead vs RateLimiter?"* → `RateLimiter` limits calls per time period (throughput). `Bulkhead` limits concurrent in-flight calls (isolation). Use RateLimiter to protect downstream from bursts; Bulkhead to isolate failures from consuming all threads.
+
+2. *"Why exponential backoff with jitter?"* → Prevents thundering herd — all retrying clients hitting the recovered service simultaneously. Jitter adds randomness (`wait * random(0.5, 1.5)`).
+
+3. *"Resilience4j vs Hystrix?"* → Hystrix is in maintenance mode. Resilience4j is lighter, modular, functional-programming-friendly.
+
+**Common mistakes that get you rejected:**
+- Retrying on `ValidationException` — will always fail.
+- No fallback — circuit open = uncaught exception.
+- Not knowing annotation stacking order.
+
+---
+
+### Q79: Spring Profiles and @ConfigurationProperties
+**Company:** Amazon, Microsoft  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥🔥  **Round:** Phone/Onsite
+
+**Question:** Explain Spring profiles and `@ConfigurationProperties`. What is the config precedence order?
+
+**What interviewer is testing:** Production configuration management — multi-environment setup and type-safe config binding.
+
+**Ideal Answer:**
+
+**Profiles:**
+
+```java
+@Service @Profile("production")
+public class ProdEmailService implements EmailService { }
+
+@Service @Profile({"dev", "test"})
+public class MockEmailService implements EmailService { }
+```
+
+```yaml
+# application.yml (always loaded)
+spring.profiles.active: dev
+
+---
+# application-dev.yml
+spring.datasource.url: jdbc:postgresql://localhost/orders_dev
+
+---
+# application-production.yml
+spring.datasource.url: jdbc:postgresql://prod-db/orders
+```
+
+**@ConfigurationProperties — type-safe binding:**
+
+```java
+@ConfigurationProperties(prefix = "payment")
+@Validated
+public class PaymentProperties {
+    @NotBlank private String apiKey;
+    @NotNull  private URI baseUrl;
+    @Min(1) @Max(30) private int timeoutSeconds = 10;
+
+    @Valid
+    private RetryConfig retry = new RetryConfig();
+
+    @Data
+    public static class RetryConfig {
+        private int maxAttempts = 3;
+        private Duration backoff = Duration.ofMillis(500);
+    }
+}
+```
+
+```yaml
+payment:
+  api-key: ${PAYMENT_API_KEY}   # from environment variable
+  base-url: https://api.stripe.com
+  timeout-seconds: 15
+  retry:
+    max-attempts: 3
+    backoff: 500ms
+```
+
+**Config precedence (highest → lowest):**
+
+```
+1.  Command-line args:        --server.port=9090
+2.  SPRING_APPLICATION_JSON env var
+3.  System properties:        -Dserver.port=9090
+4.  OS environment variables: SERVER_PORT=9090
+5.  Profile-specific yml outside jar: application-{profile}.yml
+6.  Profile-specific yml inside jar
+7.  application.yml outside jar
+8.  application.yml inside jar
+9.  @PropertySource annotations
+10. Default properties
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"How do you inject a secret without hardcoding?"* → OS environment variable (`${SECRET_NAME}`) or Spring Cloud Vault / AWS Secrets Manager.
+
+2. *"@Value vs @ConfigurationProperties?"* → `@Value` injects one property, no validation, no nesting. `@ConfigurationProperties` binds a group to a class — validation, nested objects, relaxed binding (camelCase = kebab-case = UPPER_SNAKE_CASE).
+
+**Common mistakes that get you rejected:**
+- Hardcoding environment-specific values committed to repo.
+- Not knowing config precedence — env var silently overrides your file.
+- `@Value` for groups of related properties.
+
+---
+
+### Q80: Microservice Patterns
+**Company:** Amazon, Flipkart, Razorpay  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥🔥  **Round:** Onsite/HM
+
+**Question:** Explain service discovery, API gateway, config server, and distributed tracing in a Spring microservices architecture.
+
+**What interviewer is testing:** Systems-level thinking — how Spring Boot services integrate in a distributed system.
+
+**Ideal Answer:**
+
+**Service Discovery (Eureka):**
+
+```yaml
+eureka:
+  client:
+    service-url:
+      defaultZone: http://eureka-server:8761/eureka/
+  instance:
+    prefer-ip-address: true
+```
+
+```java
+// Load-balanced by service name
+@Bean @LoadBalanced
+public RestClient.Builder restClientBuilder() { return RestClient.builder(); }
+
+// Call by service name — Eureka resolves to actual instance
+restClient.get().uri("http://order-service/api/orders/{id}", id).retrieve().body(Order.class);
+```
+
+**API Gateway (Spring Cloud Gateway):**
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-service
+          uri: lb://order-service
+          predicates: [Path=/api/orders/**]
+          filters:
+            - name: CircuitBreaker
+              args: {name: orderServiceCB, fallbackUri: "forward:/fallback/orders"}
+```
+
+Gateway responsibilities: routing, rate limiting, JWT validation, SSL termination, circuit breaking.
+
+**Config Server:**
+
+```yaml
+# Each microservice fetches config from git-backed config server
+spring:
+  config:
+    import: "configserver:http://config-server:8888"
+  application:
+    name: order-service   # maps to order-service.yml in git repo
+```
+
+**Distributed Tracing (Micrometer Tracing + Zipkin):**
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 0.1   # 10% sampling in production
+spring:
+  zipkin:
+    base-url: http://zipkin:9411
+```
+
+Micrometer automatically instruments Spring MVC, RestClient, WebClient, JPA — adds trace/span headers, propagates context across service calls.
+
+**Correlation ID filter:**
+
+```java
+@Component
+public class CorrelationIdFilter extends OncePerRequestFilter {
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res,
+                                     FilterChain chain) throws ServletException, IOException {
+        String id = Optional.ofNullable(req.getHeader("X-Correlation-ID"))
+            .orElse(UUID.randomUUID().toString());
+        MDC.put("correlationId", id);
+        res.setHeader("X-Correlation-ID", id);
+        try { chain.doFilter(req, res); } finally { MDC.remove("correlationId"); }
+    }
+}
+// Log format: [correlationId=abc-123] Processing order 456
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"What is the Saga pattern?"* → Distributed transaction alternative to 2PC. Breaks transaction into local transactions with compensating actions. Choreography: services emit events. Orchestration: central saga coordinator drives steps.
+
+2. *"How do you guarantee event delivery after DB commit?"* → Outbox pattern: write the event to an `outbox` table in the same DB transaction as the business data. A separate process reads the outbox and publishes to Kafka. Guarantees exactly-once delivery even if the app crashes after commit but before publish.
+
+3. *"Gateway CB vs service-level CB?"* → Gateway CB: protects all clients from one failing downstream — one config. Service CB: each service independently manages its downstream — more granular, works even without a gateway.
+
+**Common mistakes that get you rejected:**
+- Describing a monolith with HTTP calls as "microservices" — no service discovery, no resilience.
+- Not mentioning the outbox pattern for reliable event publishing.
+- Thinking distributed tracing is just logging — tracing adds parent-child span relationships across service boundaries.
+
+---
+
+## Practical / Scenario-Based
+
+### Q81: High CPU on a Java Service — Diagnosis
+**Company:** Amazon, Google, Flipkart  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥🔥  **Round:** Onsite/HM
+
+**Question:** Your Java service is consuming 100% CPU. Walk me through how you diagnose and fix it.
+
+**What interviewer is testing:** Production debugging expertise — structured methodology under pressure.
+
+**Ideal Answer:**
+
+**Step 1 — Identify which threads are burning CPU:**
+
+```bash
+# Find Java process ID
+jps -l
+
+# Get thread-level CPU (Linux)
+top -H -p <PID>
+# Note TID (thread ID) of high-CPU threads — in decimal
+
+# Convert TID to hex (Java uses hex in thread dumps)
+printf '%x\n' <TID>
+```
+
+**Step 2 — Take a thread dump and correlate:**
+
+```bash
+jstack <PID> > thread-dump.txt
+# or via Spring Boot Actuator:
+curl http://localhost:8080/actuator/threaddump
+
+# Search for hex TID in dump:
+# "pool-1-thread-1" #42 ... nid=0x4d2 runnable
+#   at com.example.OrderProcessor.compute(OrderProcessor.java:78)  ← smoking gun
+```
+
+**Common root causes:**
+
+```
+Thread in tight loop (runnable, no wait)    Infinite loop / busy-wait     Fix logic
+Repeating CPU spike                         GC thrashing (heap pressure)  Increase -Xmx, fix leak
+Regex engine high CPU                       Catastrophic backtracking     Fix regex pattern
+Thread pool saturation                      Too many tasks                Tune pool + circuit breaker
+```
+
+**Step 3 — GC pressure check:**
+
+```bash
+jstat -gcutil <PID> 1000 10   # GC stats every 1s
+# FGC count rising fast → GC thrashing
+# Old gen (OU) rising after GC → memory leak
+```
+
+**Step 4 — CPU profiler:**
+
+```bash
+# JDK Flight Recorder — production-safe (< 2% overhead)
+jcmd <PID> JFR.start duration=60s filename=/tmp/recording.jfr settings=profile
+# Analyze in JDK Mission Control: hot methods, call tree, lock analysis
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"How do you diagnose a deadlock?"* → Thread dump — look for "Found one Java-level deadlock" section. Shows Thread A waiting for lock held by B, B waiting for lock held by A.
+
+2. *"High CPU but no hot threads?"* → Check GC CPU — `jstat -gcutil` shows if GC overhead is high. Also JIT compilation threads spike during warmup.
+
+3. *"Production-safe profiling tools?"* → JFR (< 2% overhead), Async-Profiler (no safepoint bias). Never use `-Xrunhprof` in production.
+
+**Common mistakes that get you rejected:**
+- Starting with heap dump for CPU issues — heap dump is for memory, thread dump for CPU.
+- Not knowing jstack or JFR.
+
+---
+
+### Q82: Memory Leak in a Spring Boot Service
+**Company:** Amazon, Google  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥🔥  **Round:** Onsite/HM
+
+**Question:** Your Spring Boot service has a memory leak — heap grows until OOM. How do you find and fix it?
+
+**What interviewer is testing:** Heap dump analysis methodology and knowledge of common Spring leak patterns.
+
+**Ideal Answer:**
+
+**Step 1 — Confirm leak vs heap sizing:**
+
+```bash
+jstat -gcutil <PID> 5000 20
+# OU (Old Used %) rising continuously after GC → confirmed leak
+```
+
+**Step 2 — Capture heap dump:**
+
+```bash
+# From live process
+jmap -dump:format=b,file=/tmp/heap.hprof <PID>
+
+# Automatically on OOM (add to JVM flags — ALWAYS in production)
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/dumps/
+
+# Via Actuator
+curl http://localhost:8080/actuator/heapdump -o heap.hprof
+```
+
+**Step 3 — Analyze with Eclipse MAT:**
+
+```
+1. Open heap.hprof in MAT
+2. Run "Leak Suspects Report" — MAT identifies the likely leak
+3. Check "Dominator Tree" — largest objects retaining memory
+4. "Retained Heap" shows what would be freed if object released
+
+Common findings:
+  - ArrayList / HashMap growing without bound
+  - ClassLoader with many loaded classes (dynamic proxies, hot-reload)
+  - ThreadLocal values not removed (ThreadLocal.remove() never called)
+```
+
+**Quick histogram (no dump needed):**
+
+```bash
+jmap -histo <PID> | head -30
+# Unexpectedly large count for domain objects = leak
+# e.g., 500,000 UserSession instances when you expect ~100
+```
+
+**Common Spring Boot leak patterns:**
+
+```java
+// 1. ThreadLocal not cleaned — leaks across pooled thread reuse
+public class RequestFilter extends OncePerRequestFilter {
+    static final ThreadLocal<RequestContext> ctx = new ThreadLocal<>();
+    protected void doFilterInternal(...) {
+        ctx.set(new RequestContext(request));
+        try { chain.doFilter(req, res); }
+        finally { ctx.remove(); }   // MUST call remove()
+    }
+}
+
+// 2. Static unbounded cache
+static final Map<String, Result> cache = new HashMap<>();   // never evicted
+// Fix: use Caffeine/Guava cache with size/time eviction
+
+// 3. Event listener holding large object reference
+@EventListener
+public void onEvent(LargeEvent e) { this.lastEvent = e; }   // retains large graph
+
+// 4. Hibernate L2 cache misconfigured — caches everything with no eviction limit
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Shallow vs retained heap in MAT?"* → Shallow: memory of the object itself. Retained: total memory freed if this object and everything it exclusively retains were GC'd. Retained heap identifies the leak root.
+
+2. *"How to prevent ThreadLocal leaks?"* → Always call `ThreadLocal.remove()` in a `finally` block. Prefer request-scoped Spring beans for request-scoped data.
+
+**Common mistakes that get you rejected:**
+- No `-XX:+HeapDumpOnOutOfMemoryError` in production — you lose the evidence.
+- Not knowing about ThreadLocal leaks in thread-pool environments.
+
+---
+
+### Q83: N+1 Query — Full Walkthrough
+**Company:** Amazon, Flipkart  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥🔥  **Round:** Onsite
+
+**Question:** You detect N+1 queries causing slowness. Walk through detection, diagnosis, and all fix options with trade-offs.
+
+**What interviewer is testing:** Full JPA performance workflow — finding and fixing N+1 systematically.
+
+**Ideal Answer:**
+
+**Detection:**
+
+```yaml
+spring.jpa.properties.hibernate.generate_statistics: true
+logging.level.org.hibernate.stat: DEBUG
+logging.level.org.hibernate.SQL: DEBUG
+```
+
+Or p6spy — logs every SQL with parameters and timing. Search for 100+ identical queries differing only in the id parameter.
+
+**Root cause:**
+
+```java
+List<Order> orders = orderRepo.findAll();           // 1 query
+for (Order o : orders) {
+    o.getCustomer().getName();   // 1 query per order = N queries
+}   // Total: 1 + N queries
+```
+
+**Fix options:**
+
+```java
+// Fix 1: JOIN FETCH
+@Query("SELECT o FROM Order o JOIN FETCH o.customer WHERE o.customerId = :id")
+List<Order> findWithCustomer(@Param("id") Long cid);
+// Pros: 1 query  Cons: no Pageable (in-memory pagination), Cartesian product for multiple collections
+
+// Fix 2: @EntityGraph (declarative, reusable)
+@EntityGraph(attributePaths = {"customer", "items"})
+List<Order> findByCustomerId(Long id);
+// Same trade-offs as JOIN FETCH
+
+// Fix 3: @BatchSize (for collections, works with Pageable)
+@OneToMany @BatchSize(size = 50)
+private List<Item> items;
+// Pros: works with Pageable  Cons: still N/50 queries
+
+// Fix 4: DTO projection (most efficient for read-heavy)
+@Query("SELECT NEW com.example.OrderDto(o.id, c.name, o.totalAmount) " +
+       "FROM Order o JOIN o.customer c WHERE o.customerId = :id")
+List<OrderDto> findDtos(@Param("id") Long cid);
+// Pros: only needed columns, no entity overhead, works with Pageable
+// Cons: no lazy loading, no entity update
+```
+
+**Decision guide:**
+
+```
+Need to update entity?        → JOIN FETCH or @EntityGraph
+Need Pageable?                → Batch fetch or DTO projection
+Read-only + specific columns? → DTO projection (fastest)
+Multiple collections?         → Batch fetch (avoids MultipleBagFetchException)
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"MultipleBagFetchException?"* → Cannot JOIN FETCH two unordered `List` collections simultaneously. Fix: change one to `Set`, or batch fetch one.
+
+2. *"Testing the fix?"* → Assert Hibernate query count: `Statistics.getQueryExecutionCount() == 1`.
+
+**Common mistakes that get you rejected:**
+- `FetchType.EAGER` as the fix — trades lazy N+1 for eager N+1.
+- JOIN FETCH with `Pageable` — in-memory pagination.
+
+---
+
+### Q84: Thread-Safe Cache Without ConcurrentHashMap
+**Company:** Google, Goldman Sachs  **Difficulty:** 🔴 Hard  **Frequency:** 🔥  **Round:** Onsite
+
+**Question:** Design a thread-safe singleton cache using `ReadWriteLock`. Compare with StampedLock.
+
+**What interviewer is testing:** Direct concurrency knowledge — lock types and the JMM.
+
+**Ideal Answer:**
+
+```java
+public class UserCache {
+    private final Map<Long, User> store = new HashMap<>();  // NOT concurrent — protected by lock
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+    private final Lock readLock  = lock.readLock();
+    private final Lock writeLock = lock.writeLock();
+
+    // Many threads can read concurrently
+    public User get(Long id) {
+        readLock.lock();
+        try { return store.get(id); }
+        finally { readLock.unlock(); }
+    }
+
+    // Only one thread writes; all readers blocked
+    public void put(Long id, User user) {
+        writeLock.lock();
+        try { store.put(id, user); }
+        finally { writeLock.unlock(); }
+    }
+
+    // Cache-aside: get-or-load
+    public User getOrLoad(Long id, Function<Long, User> loader) {
+        // Fast path: try read lock first
+        readLock.lock();
+        try { User u = store.get(id); if (u != null) return u; }
+        finally { readLock.unlock(); }
+
+        // Slow path: need write lock (MUST release read lock first — no upgrade)
+        writeLock.lock();
+        try {
+            User u = store.get(id);   // double-check — another thread may have loaded
+            if (u != null) return u;
+            User loaded = loader.apply(id);
+            store.put(id, loaded);
+            return loaded;
+        } finally { writeLock.unlock(); }
+    }
+}
+```
+
+**ReadWriteLock vs synchronized:**
+
+```
+synchronized:       one thread at a time (even reads block each other)
+ReadWriteLock:      multiple concurrent readers + exclusive writers
+                    better throughput for read-heavy caches
+```
+
+**StampedLock (Java 8+) — optimistic reads:**
+
+```java
+StampedLock sl = new StampedLock();
+long stamp = sl.tryOptimisticRead();       // no lock — very fast
+User user = store.get(id);
+if (!sl.validate(stamp)) {                 // a write happened? fall back to read lock
+    stamp = sl.readLock();
+    try { user = store.get(id); }
+    finally { sl.unlockRead(stamp); }
+}
+// StampedLock: best when reads dominate and contention is very low
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Why can't you upgrade from read to write lock directly?"* → `ReentrantReadWriteLock` does not support lock upgrade. Release read lock first, then acquire write lock — creating a window for another thread to write (hence double-check inside write lock).
+
+2. *"ConcurrentHashMap vs ReadWriteLock?"* → `ConcurrentHashMap` uses per-bucket locking — much more granular. Use it for general concurrent maps. Use `ReadWriteLock` for complex multi-step operations spanning multiple keys that must be atomic.
+
+**Common mistakes that get you rejected:**
+- Missing double-check inside write lock in `getOrLoad` — race condition.
+- Attempting direct lock upgrade.
+
+---
+
+### Q85: REST API Design Best Practices
+**Company:** Amazon, Microsoft, Adobe  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥  **Round:** HM/Phone
+
+**Question:** What are REST API design best practices? Cover status codes, idempotency, versioning, and HATEOAS.
+
+**What interviewer is testing:** API design judgment — predictable, client-friendly, evolvable APIs.
+
+**Ideal Answer:**
+
+**HTTP status codes — be precise:**
+
+```
+200 OK           — GET response, PUT/PATCH with body
+201 Created      — POST creating resource; include Location header
+204 No Content   — DELETE, PUT/PATCH with no response body
+400 Bad Request  — malformed request, validation failure
+401 Unauthorized — not authenticated
+403 Forbidden    — authenticated but not authorized
+404 Not Found    — resource doesn't exist
+409 Conflict     — duplicate, optimistic lock failure
+422 Unprocessable Entity — valid JSON but business rule violation
+429 Too Many Requests    — rate limit exceeded
+500 Internal Server Error — unexpected failure
+```
+
+**Idempotency by HTTP method:**
+
+```
+GET, PUT, DELETE → idempotent
+POST, PATCH      → NOT idempotent by default
+Making POST idempotent: Idempotency-Key header (see Q90 for implementation)
+```
+
+**Versioning strategies:**
+
+```
+1. URL path:  /api/v1/orders          — most common, explicit, cacheable
+2. Header:    Accept: application/vnd.example.v1+json  — clean URLs
+3. Query:     /api/orders?version=1   — discouraged
+
+Recommendation: URL versioning for public APIs.
+Only introduce v2 for breaking changes — don't version every endpoint.
+```
+
+**Naming:**
+
+```
+Resources are nouns:  /orders, /users (NOT /getOrders)
+Sub-resources:        /orders/{id}/items
+Plural:               /orders (not /order)
+Lowercase + hyphens:  /order-items (not /orderItems)
+Actions (exception):  /orders/{id}/cancel (verb OK when no resource name fits)
+```
+
+**HATEOAS:**
+
+```json
+{
+  "id": 123, "status": "pending",
+  "_links": {
+    "self":   { "href": "/api/orders/123" },
+    "cancel": { "href": "/api/orders/123/cancel", "method": "POST" }
+  }
+}
+```
+
+Links tell clients what actions are valid for the current state. Spring HATEOAS provides `EntityModel<T>` and `WebMvcLinkBuilder`. Mention it; don't over-sell — most teams don't fully implement HATEOAS.
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"PUT vs PATCH?"* → `PUT` replaces the entire resource (idempotent). `PATCH` partially updates (not necessarily idempotent — `PATCH /counter/increment` is not).
+
+2. *"How do you handle pagination?"* → Link headers (`Link: <url?page=2>; rel="next"`) or response envelope. Cursor-based for large/changing datasets.
+
+**Common mistakes that get you rejected:**
+- Using 200 for everything, encoding success/failure in body.
+- DELETE returning 500 on second call instead of 204/404.
+- Verb in URL: `/api/getUser`.
+
+---
+
+### Q86: Spring Circular Dependencies
+**Company:** Amazon, Flipkart  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥  **Round:** Phone/Onsite
+
+**Question:** How does Spring handle circular dependencies? Why does constructor injection detect them at startup while field injection doesn't?
+
+**What interviewer is testing:** Understanding of Spring bean instantiation and design implications.
+
+**Ideal Answer:**
+
+**Constructor injection — fails at startup (GOOD):**
+
+```java
+@Service public class A { private final B b; public A(B b) { this.b = b; } }
+@Service public class B { private final A a; public B(A a) { this.a = a; } }
+// Cannot create A without B; cannot create B without A
+// → BeanCurrentlyInCreationException at startup — fail-fast, correct behavior
+```
+
+**Field injection — silently works (BAD, Spring Boot 2.6+ disables):**
+
+```java
+@Service public class A { @Autowired B b; }
+@Service public class B { @Autowired A a; }
+// Spring creates A (without b), creates B (injects partially-constructed A),
+// then injects B into A — partially constructed A was used.
+// Spring Boot 2.6+: throws UnsatisfiedDependencyException by default
+// (spring.main.allow-circular-references=true to re-enable — a code smell flag)
+```
+
+**Fix options (refactoring always preferred):**
+
+```java
+// Option 1: @Lazy — proxy delays instantiation until first method call
+@Service public class A { public A(@Lazy B b) { this.b = b; } }
+
+// Option 2: Setter injection for one direction
+@Autowired public void setB(B b) { this.b = b; }
+
+// Option 3 (BEST): Extract shared logic to a third bean C
+// A → C ← B   (C is a shared dependency; A and B no longer coupled)
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Spring Boot 2.6 change?"* → Circular dependencies disabled by default. `BeanCurrentlyInCreationException` for all injection styles unless `spring.main.allow-circular-references=true`.
+
+2. *"When is a circular dependency acceptable?"* → Almost never — signals tight coupling. Always redesign.
+
+**Common mistakes that get you rejected:**
+- Recommending `@Lazy` as the fix without mentioning that redesign is better.
+- Not knowing Spring Boot 2.6+ changed the default.
+
+---
+
+### Q87: HikariCP Connection Pool Sizing
+**Company:** Amazon, Goldman Sachs, Flipkart  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥  **Round:** Onsite
+
+**Question:** How do you size a HikariCP connection pool? How do you diagnose pool exhaustion?
+
+**What interviewer is testing:** Production database tuning — one of the highest-impact configuration decisions.
+
+**Ideal Answer:**
+
+**The formula (HikariCP docs):**
+
+```
+connections = (core_count * 2) + effective_spindle_count
+4-core server, SSD: (4 * 2) + 1 = 9 connections
+```
+
+More connections → queuing on the DB, higher latency. Small pool + queue is more efficient.
+
+**Configuration:**
+
+```yaml
+spring.datasource.hikari:
+  maximum-pool-size: 10           # total connections (default 10)
+  minimum-idle: 5                 # idle connections kept warm
+  connection-timeout: 30000       # ms to wait for connection (throw if exceeded)
+  idle-timeout: 600000            # ms idle connection held before removed
+  max-lifetime: 1800000           # ms max lifetime (set < DB timeout)
+  keepalive-time: 60000           # heartbeat to prevent firewall kills
+  leak-detection-threshold: 5000  # log stack trace if held > 5s
+```
+
+**Pool exhaustion diagnosis:**
+
+```
+Symptom: SQLTransientConnectionException: HikariPool-1 - Connection is not available,
+         request timed out after 30000ms
+
+Check Micrometer metrics:
+  /actuator/metrics/hikaricp.connections.active
+  /actuator/metrics/hikaricp.connections.pending  ← rising = exhaustion
+  /actuator/metrics/hikaricp.connections.timeout
+
+Common causes:
+  - Long-running transactions holding connections (N+1, external API call inside @Transactional)
+  - Pool too small for concurrent request volume
+  - Slow DB (connections not returned)
+  - Connection leak (borrowed, never returned)
+  - DB-side deadlocks
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Why `max-lifetime` < DB connection timeout?"* → DB and firewalls close idle connections. If `max-lifetime` > DB timeout, HikariCP holds dead connections. Set `max-lifetime` = DB timeout − 30 seconds.
+
+2. *"Multiple pods in Kubernetes?"* → `pod_count × max_pool_size` must be < DB `max_connections`. 10 pods × 10 connections = 100 total. Use PgBouncer or RDS Proxy for large deployments.
+
+**Common mistakes that get you rejected:**
+- Setting `maximum-pool-size: 100` "to be safe" — typically hurts performance.
+- `max-lifetime` > DB timeout — dead connections in pool.
+
+---
+
+### Q88: Distributed Rate Limiter with Redis
+**Company:** Razorpay, Amazon, Flipkart  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥  **Round:** Onsite
+
+**Question:** Implement a distributed rate limiter in Spring Boot using Redis and the token bucket algorithm.
+
+**What interviewer is testing:** Distributed systems + Redis atomic Lua scripting — common at fintech companies.
+
+**Ideal Answer:**
+
+**Why Lua for atomicity:** Check-and-decrement must be atomic. If two threads both check "tokens > 0" and decrement separately, both succeed when only one token remains (TOCTOU). Redis executes Lua scripts atomically.
+
+```java
+@Service
+public class RedisRateLimiter {
+    private final StringRedisTemplate redis;
+
+    private static final String BUCKET_SCRIPT = """
+        local key = KEYS[1]
+        local capacity   = tonumber(ARGV[1])
+        local refillRate = tonumber(ARGV[2])  -- tokens/sec
+        local now        = tonumber(ARGV[3])  -- epoch ms
+        local requested  = tonumber(ARGV[4])
+
+        local bucket     = redis.call('HMGET', key, 'tokens', 'last_refill')
+        local tokens     = tonumber(bucket[1]) or capacity
+        local lastRefill = tonumber(bucket[2]) or now
+
+        local elapsed = (now - lastRefill) / 1000.0
+        tokens = math.min(capacity, tokens + elapsed * refillRate)
+
+        if tokens >= requested then
+            tokens = tokens - requested
+            redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
+            redis.call('EXPIRE', key, 3600)
+            return 1   -- allowed
+        else
+            return 0   -- denied
+        end
+        """;
+
+    private final RedisScript<Long> script = RedisScript.of(BUCKET_SCRIPT, Long.class);
+
+    public boolean isAllowed(String clientId, int capacity, int refillRate) {
+        String key = "rate_limit:" + clientId;
+        Long result = redis.execute(script, List.of(key),
+            String.valueOf(capacity), String.valueOf(refillRate),
+            String.valueOf(System.currentTimeMillis()), "1");
+        return Long.valueOf(1L).equals(result);
+    }
+}
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Why not INCR + EXPIRE (fixed window)?"* → Fixed window allows 2× the limit at window boundaries (burst at end of window 1 + burst at start of window 2). Token bucket is smoother.
+
+2. *"Lua vs MULTI/EXEC?"* → MULTI/EXEC is optimistic (watch-multi-exec; retry on conflict). Lua is pessimistic — atomic without retry logic.
+
+3. *"Redis down?"* → Fail open (allow all requests — availability > rate limiting) for most cases. Fail closed for payments only if the business requires it.
+
+**Common mistakes that get you rejected:**
+- Non-atomic check-and-decrement — rate limit bypass.
+- Fixed window without mentioning boundary burst problem.
+
+---
+
+### Q89: JWT vs Session Tokens
+**Company:** Amazon, Razorpay, Goldman Sachs  **Difficulty:** 🟡 Medium  **Frequency:** 🔥🔥🔥  **Round:** Phone/HM
+
+**Question:** Compare JWT and session tokens. Where should JWT be stored? How do you solve the JWT revocation problem?
+
+**What interviewer is testing:** Security architecture judgment — the trade-offs in production.
+
+**Ideal Answer:**
+
+```
+                    Session Token           JWT
+─────────────────── ──────────────────────  ──────────────────────
+Server storage      Required               Stateless — none needed
+Revocation          Instant (delete entry)  Hard — valid until expiry
+Horizontal scaling  Sticky sessions or      Any instance validates
+                    distributed store
+Payload             Opaque ID              Claims visible (base64)
+```
+
+**JWT storage:**
+
+```
+localStorage:    accessible to JS → XSS-vulnerable (attacker steals token)
+httpOnly Cookie: JS cannot read → XSS-proof
+                 but CSRF-vulnerable → use SameSite=Strict + CSRF protection
+Memory (JS var): XSS-proof, no CSRF, but lost on page refresh
+```
+
+Recommendation: `httpOnly` cookie + `SameSite=Strict` + `Secure`, short-lived access token (5–15 min) + refresh token rotation.
+
+**Revocation options:**
+
+```java
+// Option 1: Short expiry + refresh tokens
+// Access token short-lived → revocation window is small
+// Refresh token in DB → can be revoked instantly
+
+// Option 2: Redis blocklist (JWT ID in Redis until expiry)
+public void revokeToken(String jti, long expirySeconds) {
+    redis.opsForValue().set("revoked:" + jti, "1", Duration.ofSeconds(expirySeconds));
+}
+public boolean isRevoked(String jti) {
+    return Boolean.TRUE.equals(redis.hasKey("revoked:" + jti));
+}
+// Downside: Redis lookup per request — not fully stateless
+
+// Option 3: Refresh token rotation + replay detection
+// Each refresh issues new access + refresh tokens, invalidates old refresh token.
+// If old refresh token reused → detect replay → revoke ALL tokens for user.
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"Can JWT be encrypted?"* → Yes — JWE (JSON Web Encryption). Standard JWT (JWS) only signs — payload is base64, not encrypted. Don't put PII in JWT payload without JWE.
+
+2. *"What is the `jti` claim?"* → JWT ID — unique identifier for the token. Required for blocklist revocation and replay detection.
+
+**Common mistakes that get you rejected:**
+- JWT in localStorage — XSS-vulnerable.
+- "JWT is unrevocable" without mentioning blocklist or rotation.
+- Not knowing `SameSite=Strict` prevents CSRF for cookie-stored tokens.
+
+---
+
+### Q90: Idempotent REST Endpoint
+**Company:** Razorpay, Amazon, Goldman Sachs  **Difficulty:** 🔴 Hard  **Frequency:** 🔥🔥  **Round:** Onsite
+
+**Question:** How do you implement an idempotent REST endpoint? Walk through storage, race conditions, and expiry.
+
+**What interviewer is testing:** Production payment/order API design — mandatory at fintech companies.
+
+**Ideal Answer:**
+
+**Why idempotency matters:** Network timeouts and client retries can deliver the same `POST /payments` multiple times. Without idempotency, the customer is charged twice.
+
+**Implementation:**
+
+```java
+@Entity
+@Table(uniqueConstraints = @UniqueConstraint(columnNames = "idempotency_key"))
+public class IdempotencyRecord {
+    @Id @GeneratedValue Long id;
+    @Column(nullable = false, unique = true) String idempotencyKey;
+    @Column(nullable = false) Integer statusCode;
+    @Column(columnDefinition = "TEXT") String responseBody;
+    @Column(nullable = false) LocalDateTime expiresAt;
+}
+
+@Component
+public class IdempotencyFilter extends OncePerRequestFilter {
+    private final IdempotencyRepository repo;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res,
+                                     FilterChain chain) throws ServletException, IOException {
+        String key = req.getHeader("Idempotency-Key");
+        if (key == null) { chain.doFilter(req, res); return; }
+
+        // Return cached response for duplicate
+        Optional<IdempotencyRecord> existing =
+            repo.findByIdempotencyKeyAndExpiresAtAfter(key, LocalDateTime.now());
+        if (existing.isPresent()) {
+            IdempotencyRecord r = existing.get();
+            res.setStatus(r.getStatusCode());
+            res.setHeader("X-Idempotency-Replayed", "true");
+            res.getWriter().write(r.getResponseBody());
+            return;
+        }
+
+        // Process and cache response
+        ContentCachingResponseWrapper wrapped = new ContentCachingResponseWrapper(res);
+        try { chain.doFilter(req, wrapped); }
+        finally {
+            if (wrapped.getStatus() < 500) {  // don't cache server errors
+                try {
+                    IdempotencyRecord r = new IdempotencyRecord();
+                    r.setIdempotencyKey(key);
+                    r.setStatusCode(wrapped.getStatus());
+                    r.setResponseBody(new String(wrapped.getContentAsByteArray()));
+                    r.setExpiresAt(LocalDateTime.now().plusHours(24));
+                    repo.save(r);
+                } catch (DataIntegrityViolationException e) {
+                    // Race condition: another thread saved same key — unique constraint protects
+                    log.debug("Concurrent idempotency save for key: {}", key);
+                }
+            }
+            wrapped.copyBodyToResponse();
+        }
+    }
+}
+```
+
+**Race condition — two concurrent requests with same key:**
+
+```java
+// Use Redis SETNX to lock before processing:
+String lockKey = "idempotency_lock:" + key;
+Boolean acquired = redis.opsForValue().setIfAbsent(lockKey, "1", Duration.ofSeconds(30));
+if (!acquired) {
+    res.setStatus(409);
+    res.getWriter().write("{\"error\":\"concurrent request with same idempotency key\"}");
+    return;
+}
+try { chain.doFilter(req, wrapped); }
+finally { redis.delete(lockKey); }
+```
+
+**Follow-up questions the interviewer will ask:**
+
+1. *"How long do you retain records?"* → 24 hours — long enough for retries, short enough to manage storage (Stripe uses 24 hours).
+
+2. *"Server crashes after processing but before saving the record?"* → Use outbox pattern: save idempotency record AND business operation in the same DB transaction. Atomic commit guarantees both saved or neither.
+
+3. *"Include request body hash in the check?"* → Stripe: same key + different body → 422 (key reuse with different parameters). Others: key alone is sufficient. Document the behavior clearly.
+
+**Common mistakes that get you rejected:**
+- Not handling concurrent requests with same key — race condition.
+- Caching 5xx responses — server errors should be retryable.
+- No expiry on records — table grows forever.
+
+---
+
+---
+
+## Pattern Recap — What to Expect Per Company
+
+| Company | Java focus | Spring focus | Depth |
+|---|---|---|---|
+| Google | Concurrency, JVM, generics | Rarely Spring-specific | Very deep internals |
+| Amazon | Collections, multithreading | Spring basics + microservices | Practical, scenario-based |
+| Microsoft | OOP, design patterns | Spring MVC, REST | Clean code + testing |
+| Goldman Sachs | Core Java, serialization, JVM | Spring basics | CS fundamentals heavy |
+| Flipkart | Java 8+, concurrency | Spring Boot, JPA, performance | SDE-2 goes very deep |
+| Razorpay | Java fundamentals, streams | Spring Boot full stack | Practical + system design |
+| Adobe | OOP, design patterns | Spring MVC | Design patterns heavy |
+
+---
+
+Created **09-java-spring-boot-interview.md** — 90 questions covered (Core Java Q1–Q26, Multithreading Q27–Q40, Java 8–21 Q41–Q50, JVM Internals Q51–Q55, Design Patterns Q56–Q62, Spring Core & Boot Q63–Q80, Practical/Scenario Q81–Q90), each with complete Java code, internals explanation, follow-ups, and rejection-causing mistakes.
